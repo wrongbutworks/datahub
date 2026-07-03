@@ -83,11 +83,9 @@ def get_procedure_flow_name(
 class ProcedureCall(BaseModel):
     """A reference to a stored procedure invoked from another procedure body."""
 
-    # Immutable value object built from parsed SQL; frozen also makes it hashable.
     model_config = ConfigDict(frozen=True)
 
     database: Optional[str]
-    # ``schema`` shadows a pydantic BaseModel attribute, so the field is named
-    # ``db_schema`` (matching SchemaKey.db_schema) throughout.
+    # Named ``db_schema`` because ``schema`` shadows a BaseModel attribute.
     db_schema: Optional[str]
     name: str

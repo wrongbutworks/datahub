@@ -463,8 +463,7 @@ class TestOracleSource:
 
         # Mock inspector and connection
         mock_inspector = Mock()
-        # denormalize_name returns a real str in production; give the mock a
-        # concrete value so BaseProcedure's schema field validates.
+        # Concrete str (not a Mock) so BaseProcedure's schema field validates.
         mock_inspector.dialect.denormalize_name.return_value = "TEST_SCHEMA"
         mock_connection = Mock()
 
