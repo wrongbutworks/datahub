@@ -5,11 +5,13 @@ from datahub.emitter.mcp_builder import DatabaseKey, SchemaKey
 from datahub.ingestion.source.common.subtypes import JobContainerSubTypes
 from datahub.ingestion.source.sql.oracle import _parse_oracle_procedure_dependencies
 from datahub.ingestion.source.sql.stored_procedures.base import (
-    BaseProcedure,
     generate_procedure_lineage,
-    get_procedure_flow_name,
 )
 from datahub.ingestion.source.sql.stored_procedures.lineage import parse_procedure_code
+from datahub.ingestion.source.sql.stored_procedures.models import (
+    BaseProcedure,
+    get_procedure_flow_name,
+)
 from datahub.metadata.schema_classes import (
     DataJobInputOutputClass,
     NumberTypeClass,
