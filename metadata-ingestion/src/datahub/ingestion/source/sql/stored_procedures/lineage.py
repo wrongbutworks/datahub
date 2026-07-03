@@ -44,6 +44,26 @@ _CALL_TARGET_RE = re.compile(
     re.IGNORECASE,
 )
 
+# split_statements splits on ``;``, gluing a block-opening ``BEGIN`` onto the first
+# body statement (e.g. ``BEGIN\n CALL foo()``), which then fails to parse and drops
+# the statement. Strip the opener (``label:``, ``BEGIN``, ``BEGIN NOT ATOMIC``); TSQL
+# ``BEGIN TRY/CATCH/TRANSACTION`` are left alone (no lineage, handled elsewhere).
+_LEADING_BLOCK_OPENER_RE = re.compile(
+    r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*:\s*)?"
+    r"BEGIN\b"
+    r"(?!\s+(?:TRY|CATCH|TRANSACTION|TRAN)\b)"
+    r"(?:\s+NOT\s+ATOMIC\b)?"
+    r"\s*",
+    re.IGNORECASE,
+)
+
+# A block/control closer carries no lineage: bare ``END``, a labeled MariaDB block
+# closer (``END my_label``), or a compound-statement closer (``END IF/WHILE/LOOP/CASE``).
+_BLOCK_CLOSER_RE = re.compile(
+    r"^\s*END(?:\s+[A-Za-z_][A-Za-z0-9_]*)?\s*$",
+    re.IGNORECASE,
+)
+
 
 def _strip_identifier_quotes(ident: str) -> str:
     """Drop surrounding ``[]``, ``""``, or backtick quoting from an identifier."""
@@ -243,6 +263,17 @@ def _classify_statements(
             "CREATE OR REPLACE PROCEDURE"
         ):
             continue
+
+        # Unwrap a glued-on BEGIN so the underlying CALL/DML isn't lost.
+        stmt_stripped = _LEADING_BLOCK_OPENER_RE.sub("", stmt_stripped, count=1)
+        if not stmt_stripped:
+            continue
+
+        # Explicitly drop block closers (``END``, ``END my_label``, ``END IF`` ...);
+        # they'd parse to UNKNOWN and be dropped anyway, but skip them by design.
+        if _BLOCK_CLOSER_RE.match(stmt_stripped):
+            continue
+        stmt_upper = stmt_stripped.upper()
 
         # Try to parse — needed both to classify DML and to recognise
         # ``EXEC``/``EXECUTE`` (which sqlglot models as a structured node) and
