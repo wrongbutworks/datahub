@@ -148,6 +148,11 @@ DEFAULT_PLATFORM = "glue"
 VALID_PLATFORMS = [DEFAULT_PLATFORM, "athena"]
 
 GLUE_TABLE_TYPE_ICEBERG = "ICEBERG"
+
+# ARN authority of a Glue catalog: arn:aws:glue:{region}:{account}. Used as the key of
+# catalog_to_platform_instance; validated so a typo'd key fails at config load instead of
+# silently never matching and falling back to the wrong platform_instance.
+GLUE_CATALOG_ARN_PATTERN = re.compile(r"^arn:aws:glue:[^:\s]+:\d+$")
 JDBC_PLATFORM_MAP: Dict[str, str] = {
     "postgresql": "postgres",
     "mysql": "mysql",
@@ -197,6 +202,18 @@ class TargetPlatformConfig(ConfigModel):
         default=None,
         description="Environment used by the separate ingestion of this platform. Defaults to the Glue source env.",
     )
+
+
+@dataclass
+class ResolvedTarget:
+    """The platform_instance/env a table's URN is stamped with, after catalog resolution.
+
+    Distinct from the ``TargetPlatformConfig`` *input* type: ``env`` is always resolved here (never
+    ``None``), so call sites don't need to re-apply the source-env fallback.
+    """
+
+    platform_instance: Optional[str]
+    env: str
 
 
 class GlueSourceConfig(
@@ -327,13 +344,14 @@ class GlueSourceConfig(
     )
 
     resolve_resource_link_schema: bool = Field(
-        default=True,
+        default=False,
         description=(
             "When ingesting Lake Formation resource links (`ignore_resource_links=False`), fetch the "
             "shared table's schema from its target table in the owning account, since the link "
-            "itself carries no columns. Requires `glue:GetTable` on the target table. Best-effort: "
-            "on error the link is ingested without a schema. Set to False to rely on the owner "
-            "account's own ingestion for the schema instead."
+            "itself carries no columns. Requires `glue:GetTable` on the target table and issues one "
+            "extra API call per resource link, so it is opt-in. Best-effort: on error the link is "
+            "ingested without a schema. Leave disabled to rely on the owner account's own ingestion "
+            "for the schema instead."
         ),
     )
 
@@ -362,6 +380,20 @@ class GlueSourceConfig(
                 "glue_storage_lineage_direction must be either upstream or downstream"
             )
         return v.lower()
+
+    @field_validator("catalog_to_platform_instance")
+    @classmethod
+    def check_catalog_arn_keys(
+        cls, v: Dict[str, TargetPlatformConfig]
+    ) -> Dict[str, TargetPlatformConfig]:
+        invalid = [key for key in v if not GLUE_CATALOG_ARN_PATTERN.match(key)]
+        if invalid:
+            raise ValueError(
+                "catalog_to_platform_instance keys must be Glue catalog ARN authorities of the "
+                "form arn:aws:glue:{region}:{account} (account + region); invalid keys: "
+                f"{invalid}"
+            )
+        return v
 
     @field_validator("platform", mode="after")
     @classmethod
@@ -639,9 +671,7 @@ class GlueSource(StatefulIngestionSourceBase):
             return f"{prefix}:table/{database}/{table}"
         return f"{prefix}:database/{database}"
 
-    def _resolve_platform_instance(
-        self, catalog_id: Optional[str]
-    ) -> TargetPlatformConfig:
+    def _resolve_platform_instance(self, catalog_id: Optional[str]) -> ResolvedTarget:
         """Resolve the platform_instance/env to stamp on a table owned by ``catalog_id``.
 
         Cross-account tables (a different ``catalog_id``, or Lake Formation shared tables) must be
@@ -661,7 +691,7 @@ class GlueSource(StatefulIngestionSourceBase):
                     instance = detail.platform_instance
                 if detail.env is not None:
                     env = detail.env
-        return TargetPlatformConfig(platform_instance=instance, env=env)
+        return ResolvedTarget(platform_instance=instance, env=env)
 
     def _populate_resource_link_schema(self, table: Dict) -> Dict:
         """Backfill a resource link's schema from its target table in the owning account.
@@ -701,39 +731,39 @@ class GlueSource(StatefulIngestionSourceBase):
             return table
         return {**table, "StorageDescriptor": storage_descriptor}
 
-    def _gen_resource_link_lineage(
-        self, table: Dict, dataset_urn: str
-    ) -> Iterable[MetadataWorkUnit]:
-        """Emit a cross-account upstream edge from a Lake Formation resource link to its owner.
+    def _resource_link_owner_upstreams(self, table: Dict) -> List[UpstreamClass]:
+        """Build the cross-account upstream edge from a Lake Formation resource link to its owner.
 
         A resource-link table carries a ``TargetTable`` pointing at the shared table in the owning
-        account. We emit the link as a consumer-instance table (handled by the normal flow) with an
-        upstream edge to the owner's table URN — stamped with the owner account's instance — so the
-        shared dataset stitches back to its source instead of appearing as an unrelated duplicate.
+        account. The link is emitted as a consumer-instance table (the normal flow) with an upstream
+        edge to the owner's table URN — stamped with the owner account's instance — so the shared
+        dataset stitches back to its source instead of appearing as an unrelated duplicate. Returns
+        an empty list for non-resource-link tables, or when the target is missing identifiers.
         """
         target = table.get("TargetTable")
         if not target:
-            return
+            return []
+
+        database_name = target.get("DatabaseName")
+        name = target.get("Name")
+        if not database_name or not name:
+            self.report.warning(
+                title="Resource link missing target identifiers",
+                message="A Lake Formation resource link's TargetTable is missing its database or "
+                "table name, so its cross-account upstream edge could not be built. The shared "
+                "table will be ingested without lineage back to its owner.",
+                context=f"{table.get('DatabaseName')}.{table.get('Name')} -> {target}",
+            )
+            return []
 
         owner = self._resolve_platform_instance(target.get("CatalogId"))
-        owner_name = f"{target['DatabaseName']}.{target['Name']}"
         owner_urn = make_dataset_urn_with_platform_instance(
             platform=self.platform,
-            name=owner_name,
-            env=owner.env or self.env,
+            name=f"{database_name}.{name}",
+            env=owner.env,
             platform_instance=owner.platform_instance,
         )
-        yield MetadataChangeProposalWrapper(
-            entityUrn=dataset_urn,
-            aspect=UpstreamLineageClass(
-                upstreams=[
-                    UpstreamClass(
-                        dataset=owner_urn,
-                        type=DatasetLineageTypeClass.COPY,
-                    )
-                ]
-            ),
-        ).as_workunit()
+        return [UpstreamClass(dataset=owner_urn, type=DatasetLineageTypeClass.COPY)]
 
     @classmethod
     def create(cls, config_dict, ctx):
@@ -1875,13 +1905,11 @@ class GlueSource(StatefulIngestionSourceBase):
         dataset_urn = make_dataset_urn_with_platform_instance(
             platform=self.platform,
             name=full_table_name,
-            env=resolved.env or self.env,
+            env=resolved.env,
             platform_instance=resolved.platform_instance,
         )
 
         yield from self._extract_record(dataset_urn, table, full_table_name)
-        # For Lake Formation resource links, stitch the shared table back to its owning account.
-        yield from self._gen_resource_link_lineage(table, dataset_urn)
         # generate a Dataset snapshot
         # We also want to assign "table" subType to the dataset representing glue table - unfortunately it is not
         # possible via Dataset snapshot embedded in a mce, so we have to generate a mcp.
@@ -2066,10 +2094,33 @@ class GlueSource(StatefulIngestionSourceBase):
         if self.source_config.extract_column_parameters:
             yield from self._get_column_param_workunits(table, dataset_urn)
 
-        # Add lineage if enabled
+        # Add lineage if enabled. Storage lineage and Lake Formation resource-link lineage both
+        # target this dataset's own URN with a full-replace UpstreamLineage aspect, so they must be
+        # merged into one aspect — emitting both separately would clobber whichever GMS applies last.
+        resource_link_upstreams = self._resource_link_owner_upstreams(table)
         lineage_wu = self.get_lineage_if_enabled(metadata_record)
-        if lineage_wu:
+        if (
+            lineage_wu is not None
+            and resource_link_upstreams
+            and isinstance(lineage_wu.metadata, MetadataChangeProposalWrapper)
+            and lineage_wu.metadata.entityUrn == dataset_urn
+            and isinstance(lineage_wu.metadata.aspect, UpstreamLineageClass)
+        ):
+            # Upstream-direction storage lineage lands on this dataset's URN — fold the owner edge in.
+            lineage_wu.metadata.aspect.upstreams = [
+                *lineage_wu.metadata.aspect.upstreams,
+                *resource_link_upstreams,
+            ]
             yield lineage_wu
+        else:
+            # Storage lineage is off or targets a different URN (downstream direction); emit each.
+            if lineage_wu is not None:
+                yield lineage_wu
+            if resource_link_upstreams:
+                yield MetadataChangeProposalWrapper(
+                    entityUrn=dataset_urn,
+                    aspect=UpstreamLineageClass(upstreams=resource_link_upstreams),
+                ).as_workunit()
 
         # Add profile if enabled
         try:

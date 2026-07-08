@@ -170,3 +170,5 @@ source:
 ```
 
 A table whose catalog is not listed falls back to the source's own `platform_instance`/`env`. For Lake Formation resource links, the connector also emits an upstream lineage edge to the owning table's URN (resolved through this same map), so the shared table stitches back to its source instead of looking like a duplicate.
+
+A resource link carries no schema of its own. To backfill it from the owning account's target table, enable `resolve_resource_link_schema` — it is opt-in because it issues one extra `glue:GetTable` call per link and requires `glue:GetTable` on the owner account. Left disabled, the shared table relies on the owner account's own ingestion for its schema.

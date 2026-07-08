@@ -15,6 +15,7 @@ from datahub.api.entities.external.lake_formation_external_entites import (
     LakeFormationTag,
 )
 from datahub.emitter.mce_builder import make_tag_urn
+from datahub.emitter.mcp import MetadataChangeProposalWrapper
 from datahub.ingestion.api.common import PipelineContext
 from datahub.ingestion.extractor.schema_util import avro_schema_to_mce_fields
 from datahub.ingestion.graph.client import DataHubGraph
@@ -312,7 +313,9 @@ def test_catalog_to_platform_instance_resolves_owning_account():
             catalog_to_platform_instance={
                 "arn:aws:glue:us-west-2:111122223333": {
                     "platform_instance": "domain_a",
-                    "env": "PROD",
+                    # A non-default env, so the assertion below actually proves the override
+                    # was applied rather than falling through to the source's default (PROD).
+                    "env": "DEV",
                 }
             },
         ),
@@ -321,7 +324,7 @@ def test_catalog_to_platform_instance_resolves_owning_account():
     # Owning account present in the map -> stamp its instance/env.
     mapped = source._resolve_platform_instance("111122223333")
     assert mapped.platform_instance == "domain_a"
-    assert mapped.env == "PROD"
+    assert mapped.env == "DEV"
 
     # Account not in the map -> fall back to the source's own platform_instance.
     fallback = source._resolve_platform_instance("999988887777")
@@ -329,6 +332,25 @@ def test_catalog_to_platform_instance_resolves_owning_account():
 
     # No catalog id -> fall back as well.
     assert source._resolve_platform_instance(None).platform_instance == "ingestion_acct"
+
+
+def test_catalog_to_platform_instance_partial_override_keeps_source_instance():
+    # An entry that overrides only env must keep the source's own platform_instance (the two
+    # overrides are independent), and vice versa.
+    source = GlueSource(
+        ctx=PipelineContext(run_id="glue-source-test"),
+        config=GlueSourceConfig(
+            aws_region="us-west-2",
+            platform_instance="ingestion_acct",
+            env="PROD",
+            catalog_to_platform_instance={
+                "arn:aws:glue:us-west-2:111122223333": {"env": "DEV"},
+            },
+        ),
+    )
+    resolved = source._resolve_platform_instance("111122223333")
+    assert resolved.platform_instance == "ingestion_acct"
+    assert resolved.env == "DEV"
 
 
 def test_catalog_to_platform_instance_is_region_specific():
@@ -385,28 +407,104 @@ def test_resource_link_emits_upstream_edge_to_owner():
             },
         ),
     )
-    consumer_urn = (
-        "urn:li:dataset:(urn:li:dataPlatform:glue,"
-        "consumer_inst.mixed-database.shared-transactions,PROD)"
+    upstreams = source._resource_link_owner_upstreams(
+        resource_link_table_in_mixed_database
     )
 
-    wus = list(
-        source._gen_resource_link_lineage(
-            resource_link_table_in_mixed_database, consumer_urn
-        )
-    )
+    assert [u.dataset for u in upstreams] == [
+        "urn:li:dataset:(urn:li:dataPlatform:glue,owner_inst.test-database.transactions,PROD)"
+    ]
+    assert upstreams[0].type == models.DatasetLineageTypeClass.COPY
 
+
+def test_resource_link_owner_upstreams_handles_malformed_target():
+    # A TargetTable missing its Name must not crash the whole run; it should be skipped with a
+    # reported warning and no upstream produced.
+    source = GlueSource(
+        ctx=PipelineContext(run_id="glue-source-test"),
+        config=GlueSourceConfig(aws_region="us-east-1"),
+    )
+    malformed = {
+        "Name": "shared-transactions",
+        "DatabaseName": "mixed-database",
+        "TargetTable": {"CatalogId": "432143214321", "DatabaseName": "test-database"},
+    }
+
+    upstreams = source._resource_link_owner_upstreams(malformed)
+
+    assert upstreams == []
+    assert source.report.warnings
+
+
+def test_resource_link_upstream_merged_with_storage_lineage():
+    # A resource link with a backfilled StorageDescriptor (so storage lineage also fires) must not
+    # lose either edge: the owner upstream and the S3 storage upstream must land in a SINGLE
+    # UpstreamLineage aspect on the dataset, not two aspects that clobber each other.
+    source = GlueSource(
+        ctx=PipelineContext(run_id="glue-source-test"),
+        config=GlueSourceConfig(
+            aws_region="us-east-1",
+            platform_instance="consumer_inst",
+            emit_storage_lineage=True,
+            include_column_lineage=False,
+            use_s3_bucket_tags=False,
+            use_s3_object_tags=False,
+            catalog_to_platform_instance={
+                "arn:aws:glue:us-east-1:432143214321": {
+                    "platform_instance": "owner_inst"
+                },
+            },
+        ),
+    )
+    table = {
+        "Name": "shared-transactions",
+        "DatabaseName": "mixed-database",
+        "CatalogId": "123412341234",
+        "TargetTable": {
+            "CatalogId": "432143214321",
+            "DatabaseName": "test-database",
+            "Name": "transactions",
+        },
+        "StorageDescriptor": {
+            "Columns": [{"Name": "txn_id", "Type": "bigint", "Comment": ""}],
+            "Location": "s3://owner-bucket/transactions",
+        },
+    }
+
+    wus = list(source._gen_table_wu(table))
     upstream_aspects = [
         wu.metadata.aspect
         for wu in wus
-        if hasattr(wu.metadata, "aspect")
+        if isinstance(wu.metadata, MetadataChangeProposalWrapper)
         and isinstance(wu.metadata.aspect, models.UpstreamLineageClass)
     ]
     assert len(upstream_aspects) == 1
-    upstream_datasets = [u.dataset for u in upstream_aspects[0].upstreams]
-    assert upstream_datasets == [
+    datasets = {u.dataset for u in upstream_aspects[0].upstreams}
+    assert (
         "urn:li:dataset:(urn:li:dataPlatform:glue,owner_inst.test-database.transactions,PROD)"
-    ]
+        in datasets
+    )
+    assert any("dataPlatform:s3" in d for d in datasets)
+
+
+def test_resolve_resource_link_schema_defaults_to_false():
+    # Backfilling a resource link's schema issues an extra cross-account glue:GetTable call and
+    # needs a new IAM permission, so it must be opt-in like the other extra-API-call flags.
+    assert (
+        GlueSourceConfig(aws_region="us-east-1").resolve_resource_link_schema is False
+    )
+
+
+def test_catalog_to_platform_instance_rejects_malformed_arn_key():
+    # A typo'd key would silently never match and fall back to the wrong instance, defeating the
+    # whole point of the feature. Reject it at config load instead.
+    with pytest.raises(pydantic.ValidationError):
+        GlueSourceConfig(
+            aws_region="us-east-1",
+            catalog_to_platform_instance={
+                "111122223333": {"platform_instance": "domain_a"},
+            },
+        )
 
 
 def test_resource_link_schema_resolved_from_target():
@@ -467,6 +565,7 @@ def test_glue_ingest_cross_account_and_resource_links(
             extract_transforms=False,
             use_s3_bucket_tags=False,
             use_s3_object_tags=False,
+            resolve_resource_link_schema=True,
             catalog_to_platform_instance={
                 "arn:aws:glue:us-east-1:432143214321": {
                     "platform_instance": "owner_domain"
@@ -613,6 +712,7 @@ def test_glue_moto_cross_account_and_resource_link_lineage() -> None:
             extract_transforms=False,
             use_s3_bucket_tags=False,
             use_s3_object_tags=False,
+            resolve_resource_link_schema=True,
             database_pattern={"allow": ["analytics_db"]},
             catalog_to_platform_instance={
                 f"arn:aws:glue:{region}:{consumer_account}": {
