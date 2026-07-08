@@ -47,13 +47,15 @@ public class LineageController {
   @PostMapping(value = "/scroll", produces = MediaType.APPLICATION_JSON_VALUE)
   @Operation(
       summary =
-          "Scroll lineage relationships with configurable filters on source/destination types and edges.")
+          "Scroll lineage relationships with configurable filters on source/destination types and edges."
+              + " Optional entityUrn uses walker-relative direction (like relationship GET by entity).")
   public ResponseEntity<GenericScrollResult<GenericRelationship>> scrollLineage(
       HttpServletRequest request,
       @RequestParam(value = "relationshipTypes", required = false) String[] relationshipTypes,
       @RequestParam(value = "sourceTypes", required = false) String[] sourceTypes,
       @RequestParam(value = "destinationTypes", required = false) String[] destinationTypes,
       @RequestParam(value = "direction", defaultValue = "OUTGOING") String direction,
+      @RequestParam(value = "entityUrn", required = false) String entityUrn,
       @RequestParam(value = "count", defaultValue = "10") Integer count,
       @RequestParam(value = "scrollId", required = false) String scrollId,
       @RequestParam(value = "includeSoftDelete", required = false, defaultValue = "false")
@@ -82,6 +84,7 @@ public class LineageController {
         sliceMax,
         pitKeepAlive,
         body,
-        baseFilters);
+        baseFilters,
+        entityUrn);
   }
 }

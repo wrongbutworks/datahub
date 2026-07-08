@@ -44,6 +44,12 @@ public final class ScrollUtils {
    * Shared implementation for scroll endpoints. When {@code baseFilters} is non-null its filters
    * (e.g. lineage triplets) are applied additively to the filters derived from the request
    * parameters.
+   *
+   * <p>When {@code entityUrn} is set, {@code direction} is interpreted as walker-relative to that
+   * entity (same as {@code GET /{entityName}/{entityUrn}}): the URN is pinned on the destination
+   * for {@code INCOMING} or the source for {@code OUTGOING}, and the relationship filter uses
+   * {@code UNDIRECTED}. When {@code entityUrn} is absent, {@code direction} retains its existing
+   * query-role field-remap semantics for {@code sourceFilter}/{@code destinationFilter}.
    */
   public static ResponseEntity<GenericScrollResult<GenericRelationship>> doScrollRelationships(
       OperationContext systemOperationContext,
@@ -64,6 +70,48 @@ public final class ScrollUtils {
       String pitKeepAlive,
       ScrollRelationshipsRequestBody body,
       @Nullable GraphFilters baseFilters) {
+    return doScrollRelationships(
+        systemOperationContext,
+        authorizationChain,
+        graphService,
+        request,
+        operationName,
+        usageOperation,
+        relationshipTypes,
+        sourceTypes,
+        destinationTypes,
+        direction,
+        count,
+        scrollId,
+        includeSoftDelete,
+        sliceId,
+        sliceMax,
+        pitKeepAlive,
+        body,
+        baseFilters,
+        null);
+  }
+
+  public static ResponseEntity<GenericScrollResult<GenericRelationship>> doScrollRelationships(
+      OperationContext systemOperationContext,
+      AuthorizerChain authorizationChain,
+      GraphService graphService,
+      HttpServletRequest request,
+      String operationName,
+      UsageOperation usageOperation,
+      String[] relationshipTypes,
+      String[] sourceTypes,
+      String[] destinationTypes,
+      String direction,
+      Integer count,
+      String scrollId,
+      Boolean includeSoftDelete,
+      Integer sliceId,
+      Integer sliceMax,
+      String pitKeepAlive,
+      ScrollRelationshipsRequestBody body,
+      @Nullable GraphFilters baseFilters,
+      @Nullable String entityUrn) {
 
     Authentication authentication = AuthenticationContext.getAuthentication();
     OperationContext opContext =
@@ -86,6 +134,18 @@ public final class ScrollUtils {
                             SetMode.IGNORE_NULL));
 
     if (!AuthUtil.isAPIAuthorized(opContext, RELATIONSHIP, READ)) {
+      throw new UnauthorizedException(
+          authentication.getActor().toUrnStr()
+              + " is unauthorized to "
+              + READ
+              + " "
+              + RELATIONSHIP);
+    }
+
+    final boolean walkerMode = entityUrn != null && !entityUrn.isBlank();
+    if (walkerMode
+        && !AuthUtil.isAPIAuthorizedUrns(
+            opContext, RELATIONSHIP, READ, List.of(UrnUtils.getUrn(entityUrn)))) {
       throw new UnauthorizedException(
           authentication.getActor().toUrnStr()
               + " is unauthorized to "
@@ -122,6 +182,22 @@ public final class ScrollUtils {
     } catch (IllegalArgumentException e) {
       throw new IllegalArgumentException(
           "Direction must be INCOMING, OUTGOING, or UNDIRECTED, got: " + direction);
+    }
+
+    if (walkerMode) {
+      // Mirror getRelationshipsByEntity: pin the focal URN; do not field-swap filters.
+      if (relationshipDirection == RelationshipDirection.UNDIRECTED) {
+        throw new IllegalArgumentException(
+            "When entityUrn is set, direction must be INCOMING or OUTGOING");
+      }
+      com.linkedin.metadata.query.filter.Filter entityUrnFilter =
+          QueryUtils.newFilter("urn", entityUrn);
+      if (relationshipDirection == RelationshipDirection.INCOMING) {
+        destinationEntityFilter = entityUrnFilter;
+      } else {
+        sourceEntityFilter = entityUrnFilter;
+      }
+      relationshipDirection = RelationshipDirection.UNDIRECTED;
     }
 
     // Build GraphFilters from the request parameters.
