@@ -867,6 +867,29 @@ def test_catalog_to_platform_instance_accepts_china_arn():
     )
 
 
+def test_catalog_to_platform_instance_accepts_unrecognized_region():
+    # botocore doesn't recognize a not-yet-published region; the partition lookup falls back to
+    # commercial `aws`, so a valid future-region ARN validates instead of being wrongly rejected.
+    config = GlueSourceConfig(
+        aws_region="xx-future-1",
+        catalog_to_platform_instance={
+            "arn:aws:glue:xx-future-1:111122223333": {"platform_instance": "x"},
+        },
+    )
+    assert config.catalog_to_platform_instance
+
+
+def test_get_glue_arn_uses_region_partition():
+    # The qualifiedName ARN must use the region's partition (GovCloud here), not a hardcoded `aws`.
+    source = GlueSource(
+        ctx=PipelineContext(run_id="glue-source-test"),
+        config=GlueSourceConfig(aws_region="us-gov-west-1"),
+    )
+    assert source.get_glue_arn(account_id="123456789012", database="db", table="t") == (
+        "arn:aws-us-gov:glue:us-gov-west-1:123456789012:table/db/t"
+    )
+
+
 def test_catalog_to_platform_instance_rejects_partition_region_mismatch():
     # The commercial `aws` partition with a GovCloud region is internally inconsistent: the lookup
     # derives the partition from the region (aws-us-gov), so this key would never match. Reject it

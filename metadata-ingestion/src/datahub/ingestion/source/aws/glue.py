@@ -166,7 +166,9 @@ def _aws_partition_for_region(region: str) -> str:
     """
     try:
         return botocore.session.get_session().get_partition_for_region(region)
-    except Exception:
+    except botocore.exceptions.UnknownRegionError:
+        # A region botocore doesn't recognize (e.g. not-yet-published) — assume commercial rather
+        # than fail; a genuine botocore API change surfaces instead of silently degrading here.
         return "aws"
 
 
@@ -365,7 +367,8 @@ class GlueSourceConfig(
             "account's own Glue ingestion produces, instead of the ingestion account's instance. "
             "The key is account + region — account alone is not unique across regions — and matches "
             "the key used by the Spark/OpenLineage `connections` map. The partition must match the "
-            "region: `aws` for commercial, `aws-us-gov` for GovCloud, `aws-cn` for China."
+            "region as resolved by boto3 — `aws` for commercial, `aws-us-gov` for GovCloud, "
+            "`aws-cn` for China, and the `aws-iso*` partitions for isolated regions."
         ),
     )
 
@@ -705,7 +708,8 @@ class GlueSource(StatefulIngestionSourceBase):
     def get_glue_arn(
         self, account_id: str, database: str, table: Optional[str] = None
     ) -> str:
-        prefix = f"arn:aws:glue:{self.source_config.aws_region}:{account_id}"
+        region = self.source_config.aws_region or ""
+        prefix = f"arn:{_aws_partition_for_region(region)}:glue:{region}:{account_id}"
         if table:
             return f"{prefix}:table/{database}/{table}"
         return f"{prefix}:database/{database}"
@@ -839,12 +843,17 @@ class GlueSource(StatefulIngestionSourceBase):
         # (consistent with the storage-lineage path) and only possible once the schema is backfilled.
         fine_grained_lineages: List[FineGrainedLineageClass] = []
         if self.source_config.include_column_lineage and schema_metadata:
-            fine_grained_lineages = [
+            for field in schema_metadata.fields:
                 # Same field on both sides — the link and its target are the same physical table.
-                self._make_field_lineage(dataset_urn, path, owner_urn, path)
-                for field in schema_metadata.fields
-                for path in [Dataset._simplify_field_path(field.fieldPath)]
-            ]
+                path = Dataset._simplify_field_path(field.fieldPath)
+                fine_grained_lineages.append(
+                    self._make_field_lineage(
+                        downstream_urn=dataset_urn,
+                        downstream_field=path,
+                        upstream_urn=owner_urn,
+                        upstream_field=path,
+                    )
+                )
         return ResourceLinkLineage(
             upstreams=[
                 UpstreamClass(dataset=owner_urn, type=DatasetLineageTypeClass.COPY)
@@ -1668,6 +1677,7 @@ class GlueSource(StatefulIngestionSourceBase):
 
     @staticmethod
     def _make_field_lineage(
+        *,
         downstream_urn: str,
         downstream_field: str,
         upstream_urn: str,
@@ -1707,10 +1717,12 @@ class GlueSource(StatefulIngestionSourceBase):
                 if matching_upstream_field:
                     fine_grained_lineages.append(
                         self._make_field_lineage(
-                            dataset_urn,
-                            field_path_v1,
-                            upstream_urn,
-                            simplify_field_path(matching_upstream_field.fieldPath),
+                            downstream_urn=dataset_urn,
+                            downstream_field=field_path_v1,
+                            upstream_urn=upstream_urn,
+                            upstream_field=simplify_field_path(
+                                matching_upstream_field.fieldPath
+                            ),
                         )
                     )
             return fine_grained_lineages
