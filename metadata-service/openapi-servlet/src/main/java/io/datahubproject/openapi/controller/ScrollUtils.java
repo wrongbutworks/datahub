@@ -47,8 +47,9 @@ public final class ScrollUtils {
    *
    * <p>When {@code entityUrn} is set, {@code direction} is interpreted as walker-relative to that
    * entity (same as {@code GET /{entityName}/{entityUrn}}): the URN is pinned on the destination
-   * for {@code INCOMING} or the source for {@code OUTGOING}, and the relationship filter uses
-   * {@code UNDIRECTED}. When {@code entityUrn} is absent, {@code direction} retains its existing
+   * for {@code INCOMING} or the source for {@code OUTGOING}. The internal relationship filter uses
+   * {@code OUTGOING} so GraphQueryUtils maps source/destination filters onto document fields
+   * without remapping. When {@code entityUrn} is absent, {@code direction} retains its existing
    * query-role field-remap semantics for {@code sourceFilter}/{@code destinationFilter}.
    */
   public static ResponseEntity<GenericScrollResult<GenericRelationship>> doScrollRelationships(
@@ -185,7 +186,8 @@ public final class ScrollUtils {
     }
 
     if (walkerMode) {
-      // Mirror getRelationshipsByEntity: pin the focal URN; do not field-swap filters.
+      // Mirror getRelationshipsByEntity: pin the focal URN on a literal edge end.
+      // Use OUTGOING for the relationship filter so GraphQueryUtils does not remap fields.
       if (relationshipDirection == RelationshipDirection.UNDIRECTED) {
         throw new IllegalArgumentException(
             "When entityUrn is set, direction must be INCOMING or OUTGOING");
@@ -197,7 +199,7 @@ public final class ScrollUtils {
       } else {
         sourceEntityFilter = entityUrnFilter;
       }
-      relationshipDirection = RelationshipDirection.UNDIRECTED;
+      relationshipDirection = RelationshipDirection.OUTGOING;
     }
 
     // Build GraphFilters from the request parameters.

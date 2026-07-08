@@ -369,6 +369,8 @@ public class RelationshipControllerTest extends AbstractTestNGSpringContextTests
     // Use ArgumentCaptor to verify the correct filter parameters for INCOMING
     ArgumentCaptor<Filter> sourceEntityFilterCaptor = ArgumentCaptor.forClass(Filter.class);
     ArgumentCaptor<Filter> destEntityFilterCaptor = ArgumentCaptor.forClass(Filter.class);
+    ArgumentCaptor<RelationshipFilter> relationshipFilterCaptor =
+        ArgumentCaptor.forClass(RelationshipFilter.class);
 
     when(mockGraphService.scrollRelatedEntities(
             any(),
@@ -377,7 +379,7 @@ public class RelationshipControllerTest extends AbstractTestNGSpringContextTests
             isNull(),
             destEntityFilterCaptor.capture(),
             anySet(),
-            any(),
+            relationshipFilterCaptor.capture(),
             any(),
             isNull(),
             anyString(),
@@ -395,10 +397,16 @@ public class RelationshipControllerTest extends AbstractTestNGSpringContextTests
         .andExpect(status().is2xxSuccessful())
         .andExpect(jsonPath("$.scrollId").value("test-scroll-id"));
 
-    // Verify INCOMING direction: sourceTypes=null, sourceEntityFilter=EMPTY, destTypes=null,
-    // destEntityFilter=entityUrn
-    assertNotNull(sourceEntityFilterCaptor.getValue());
-    assertNotNull(destEntityFilterCaptor.getValue());
+    // Verify INCOMING: dest pinned to entityUrn; RelationshipFilter OUTGOING avoids field remap
+    assertTrue(
+        sourceEntityFilterCaptor.getValue().getOr().isEmpty()
+            || sourceEntityFilterCaptor.getValue().getOr().stream()
+                .allMatch(cc -> cc.getAnd().isEmpty()));
+    Filter destFilter = destEntityFilterCaptor.getValue();
+    assertEquals(destFilter.getOr().get(0).getAnd().get(0).getField(), "urn");
+    assertEquals(destFilter.getOr().get(0).getAnd().get(0).getValues().get(0), entityUrn);
+    assertEquals(
+        relationshipFilterCaptor.getValue().getDirection(), RelationshipDirection.OUTGOING);
   }
 
   @Test
@@ -411,6 +419,8 @@ public class RelationshipControllerTest extends AbstractTestNGSpringContextTests
     // Use ArgumentCaptor to verify the correct filter parameters for OUTGOING
     ArgumentCaptor<Filter> sourceEntityFilterCaptor = ArgumentCaptor.forClass(Filter.class);
     ArgumentCaptor<Filter> destEntityFilterCaptor = ArgumentCaptor.forClass(Filter.class);
+    ArgumentCaptor<RelationshipFilter> relationshipFilterCaptor =
+        ArgumentCaptor.forClass(RelationshipFilter.class);
 
     when(mockGraphService.scrollRelatedEntities(
             any(),
@@ -419,7 +429,7 @@ public class RelationshipControllerTest extends AbstractTestNGSpringContextTests
             isNull(),
             destEntityFilterCaptor.capture(),
             anySet(),
-            any(),
+            relationshipFilterCaptor.capture(),
             any(),
             isNull(),
             anyString(),
@@ -437,10 +447,16 @@ public class RelationshipControllerTest extends AbstractTestNGSpringContextTests
         .andExpect(status().is2xxSuccessful())
         .andExpect(jsonPath("$.scrollId").value("test-scroll-id"));
 
-    // Verify OUTGOING direction: sourceTypes=null, sourceEntityFilter=entityUrn, destTypes=null,
-    // destEntityFilter=EMPTY
-    assertNotNull(sourceEntityFilterCaptor.getValue());
-    assertNotNull(destEntityFilterCaptor.getValue());
+    // Verify OUTGOING: source pinned to entityUrn; RelationshipFilter OUTGOING avoids field remap
+    Filter sourceFilter = sourceEntityFilterCaptor.getValue();
+    assertEquals(sourceFilter.getOr().get(0).getAnd().get(0).getField(), "urn");
+    assertEquals(sourceFilter.getOr().get(0).getAnd().get(0).getValues().get(0), entityUrn);
+    assertTrue(
+        destEntityFilterCaptor.getValue().getOr().isEmpty()
+            || destEntityFilterCaptor.getValue().getOr().stream()
+                .allMatch(cc -> cc.getAnd().isEmpty()));
+    assertEquals(
+        relationshipFilterCaptor.getValue().getDirection(), RelationshipDirection.OUTGOING);
   }
 
   @Test
@@ -1346,7 +1362,7 @@ public class RelationshipControllerTest extends AbstractTestNGSpringContextTests
         .andExpect(jsonPath("$.scrollId").value("scroll-walker-in"));
 
     GraphFilters captured = graphFiltersCaptor.getValue();
-    assertEquals(captured.getRelationshipFilter().getDirection(), RelationshipDirection.UNDIRECTED);
+    assertEquals(captured.getRelationshipFilter().getDirection(), RelationshipDirection.OUTGOING);
     Filter destFilter = captured.getDestinationEntityFilter();
     assertEquals(destFilter.getOr().get(0).getAnd().get(0).getField(), "urn");
     assertEquals(destFilter.getOr().get(0).getAnd().get(0).getValues().get(0), entityUrn);
@@ -1387,7 +1403,7 @@ public class RelationshipControllerTest extends AbstractTestNGSpringContextTests
         .andExpect(jsonPath("$.scrollId").value("scroll-walker-out"));
 
     GraphFilters captured = graphFiltersCaptor.getValue();
-    assertEquals(captured.getRelationshipFilter().getDirection(), RelationshipDirection.UNDIRECTED);
+    assertEquals(captured.getRelationshipFilter().getDirection(), RelationshipDirection.OUTGOING);
     Filter sourceFilter = captured.getSourceEntityFilter();
     assertEquals(sourceFilter.getOr().get(0).getAnd().get(0).getField(), "urn");
     assertEquals(sourceFilter.getOr().get(0).getAnd().get(0).getValues().get(0), entityUrn);
