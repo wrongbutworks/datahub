@@ -19,6 +19,7 @@ from typing import (
 from urllib.parse import urlparse
 
 import botocore.exceptions
+import botocore.session
 import yaml
 from pydantic import field_validator, model_validator
 from pydantic.fields import Field
@@ -149,11 +150,26 @@ VALID_PLATFORMS = [DEFAULT_PLATFORM, "athena"]
 
 GLUE_TABLE_TYPE_ICEBERG = "ICEBERG"
 
-# ARN authority of a Glue catalog: arn:{partition}:glue:{region}:{account}. Used as the key of
-# catalog_to_platform_instance; validated so a typo'd key fails at config load instead of
-# silently never matching and falling back to the wrong platform_instance. The partition segment
-# covers commercial (aws), GovCloud (aws-us-gov) and China (aws-cn); the account is 12 digits.
-GLUE_CATALOG_ARN_PATTERN = re.compile(r"^arn:aws(?:-us-gov|-cn)?:glue:[^:\s]+:\d{12}$")
+# Structural shape of a Glue catalog ARN authority: arn:{partition}:glue:{region}:{account}. The
+# partition/region agreement is validated separately (check_catalog_arn_keys) against botocore's
+# authoritative partition data, so the shape here only pins the segments and the 12-digit account.
+GLUE_CATALOG_ARN_PATTERN = re.compile(r"^arn:aws[a-z-]*:glue:([^:\s]+):\d{12}$")
+
+
+@lru_cache(maxsize=None)
+def _aws_partition_for_region(region: str) -> str:
+    """Authoritative ARN partition for an AWS region (aws, aws-us-gov, aws-cn, aws-iso*, ...).
+
+    Delegates to botocore's shipped endpoint data rather than a hand-maintained region-prefix table,
+    so it stays correct as AWS adds partitions. Falls back to the commercial partition for regions
+    botocore doesn't recognize (e.g. a not-yet-published region).
+    """
+    try:
+        return botocore.session.get_session().get_partition_for_region(region)
+    except Exception:
+        return "aws"
+
+
 JDBC_PLATFORM_MAP: Dict[str, str] = {
     "postgresql": "postgres",
     "mysql": "mysql",
@@ -342,13 +358,14 @@ class GlueSourceConfig(
     catalog_to_platform_instance: Dict[str, TargetPlatformConfig] = Field(
         default_factory=dict,
         description=(
-            "Maps a Glue catalog's ARN authority `arn:aws:glue:{region}:{account}` to the "
+            "Maps a Glue catalog's ARN authority `arn:{partition}:glue:{region}:{account}` to the "
             "platform_instance (and optionally env) to stamp on tables owned by that catalog. "
             "Use this for cross-account catalogs (e.g. ingesting another account via `catalog_id`, "
             "or Lake Formation shared tables) so each table's URN matches the one the owning "
             "account's own Glue ingestion produces, instead of the ingestion account's instance. "
             "The key is account + region — account alone is not unique across regions — and matches "
-            "the key used by the Spark/OpenLineage `connections` map."
+            "the key used by the Spark/OpenLineage `connections` map. The partition must match the "
+            "region: `aws` for commercial, `aws-us-gov` for GovCloud, `aws-cn` for China."
         ),
     )
 
@@ -395,12 +412,21 @@ class GlueSourceConfig(
     def check_catalog_arn_keys(
         cls, v: Dict[str, TargetPlatformConfig]
     ) -> Dict[str, TargetPlatformConfig]:
-        invalid = [key for key in v if not GLUE_CATALOG_ARN_PATTERN.match(key)]
+        invalid = []
+        for key in v:
+            match = GLUE_CATALOG_ARN_PATTERN.match(key)
+            # Reject a bad shape, or a partition that disagrees with its region — the lookup derives
+            # the partition from the region, so a mismatched key would validate but never match.
+            if not match or not key.startswith(
+                f"arn:{_aws_partition_for_region(match.group(1))}:glue:"
+            ):
+                invalid.append(key)
         if invalid:
             raise ValueError(
                 "catalog_to_platform_instance keys must be Glue catalog ARN authorities of the "
-                "form arn:aws:glue:{region}:{account} (account + region); invalid keys: "
-                f"{invalid}"
+                "form arn:{partition}:glue:{region}:{account} (account + region), where the "
+                "partition matches the region (commercial=aws, GovCloud=aws-us-gov, China=aws-cn); "
+                f"invalid keys: {invalid}"
             )
         return v
 
@@ -442,6 +468,7 @@ class GlueSourceReport(StaleEntityRemovalSourceReport):
     num_resource_link_schema_resolve_failed: int = 0
     num_resource_link_schema_unavailable: int = 0
     num_resource_link_missing_target: int = 0
+    num_resource_link_self_referential: int = 0
 
     def report_table_scanned(self) -> None:
         self.tables_scanned += 1
@@ -683,15 +710,6 @@ class GlueSource(StatefulIngestionSourceBase):
             return f"{prefix}:table/{database}/{table}"
         return f"{prefix}:database/{database}"
 
-    def _aws_partition(self) -> str:
-        """The ARN partition for the source's region (commercial, GovCloud, or China)."""
-        region = self.source_config.aws_region or ""
-        if region.startswith("us-gov-"):
-            return "aws-us-gov"
-        if region.startswith("cn-"):
-            return "aws-cn"
-        return "aws"
-
     def _resolve_platform_instance(self, catalog_id: Optional[str]) -> ResolvedTarget:
         """Resolve the platform_instance/env to stamp on a table owned by ``catalog_id``.
 
@@ -705,7 +723,8 @@ class GlueSource(StatefulIngestionSourceBase):
         instance = self.source_config.platform_instance
         env = self.env
         if catalog_id and self.source_config.catalog_to_platform_instance:
-            arn = f"arn:{self._aws_partition()}:glue:{self.source_config.aws_region}:{catalog_id}"
+            partition = _aws_partition_for_region(self.source_config.aws_region or "")
+            arn = f"arn:{partition}:glue:{self.source_config.aws_region}:{catalog_id}"
             detail = self.source_config.catalog_to_platform_instance.get(arn)
             if detail is not None:
                 if detail.platform_instance is not None:
@@ -806,6 +825,9 @@ class GlueSource(StatefulIngestionSourceBase):
             # No catalog mapping resolved the owner to a distinct instance and the link/target names
             # coincide, so the owner URN is the dataset's own URN — a self-upstream edge is
             # meaningless. Skip it (a mapping for the owning catalog is what makes them distinct).
+            # Counted so an operator can see cross-account links that produced no lineage because
+            # their owning catalog wasn't mapped in catalog_to_platform_instance.
+            self.report.num_resource_link_self_referential += 1
             logger.debug(
                 f"Skipping self-referential resource-link lineage for {dataset_urn} "
                 f"(no catalog mapping for target {target.get('CatalogId')})"
@@ -818,21 +840,10 @@ class GlueSource(StatefulIngestionSourceBase):
         fine_grained_lineages: List[FineGrainedLineageClass] = []
         if self.source_config.include_column_lineage and schema_metadata:
             fine_grained_lineages = [
-                FineGrainedLineageClass(
-                    downstreamType=FineGrainedLineageDownstreamTypeClass.FIELD,
-                    downstreams=[
-                        mce_builder.make_schema_field_urn(
-                            dataset_urn, Dataset._simplify_field_path(field.fieldPath)
-                        )
-                    ],
-                    upstreamType=FineGrainedLineageUpstreamTypeClass.FIELD_SET,
-                    upstreams=[
-                        mce_builder.make_schema_field_urn(
-                            owner_urn, Dataset._simplify_field_path(field.fieldPath)
-                        )
-                    ],
-                )
+                # Same field on both sides — the link and its target are the same physical table.
+                self._make_field_lineage(dataset_urn, path, owner_urn, path)
                 for field in schema_metadata.fields
+                for path in [Dataset._simplify_field_path(field.fieldPath)]
             ]
         return ResourceLinkLineage(
             upstreams=[
@@ -1655,6 +1666,22 @@ class GlueSource(StatefulIngestionSourceBase):
                 ),
             ).as_workunit()
 
+    @staticmethod
+    def _make_field_lineage(
+        downstream_urn: str,
+        downstream_field: str,
+        upstream_urn: str,
+        upstream_field: str,
+    ) -> FineGrainedLineageClass:
+        return FineGrainedLineageClass(
+            downstreamType=FineGrainedLineageDownstreamTypeClass.FIELD,
+            downstreams=[
+                mce_builder.make_schema_field_urn(downstream_urn, downstream_field)
+            ],
+            upstreamType=FineGrainedLineageUpstreamTypeClass.FIELD_SET,
+            upstreams=[mce_builder.make_schema_field_urn(upstream_urn, upstream_field)],
+        )
+
     def get_fine_grained_lineages(
         self,
         dataset_urn: str,
@@ -1679,22 +1706,11 @@ class GlueSource(StatefulIngestionSourceBase):
                 )
                 if matching_upstream_field:
                     fine_grained_lineages.append(
-                        FineGrainedLineageClass(
-                            downstreamType=FineGrainedLineageDownstreamTypeClass.FIELD,
-                            downstreams=[
-                                mce_builder.make_schema_field_urn(
-                                    dataset_urn, field_path_v1
-                                )
-                            ],
-                            upstreamType=FineGrainedLineageUpstreamTypeClass.FIELD_SET,
-                            upstreams=[
-                                mce_builder.make_schema_field_urn(
-                                    upstream_urn,
-                                    simplify_field_path(
-                                        matching_upstream_field.fieldPath
-                                    ),
-                                )
-                            ],
+                        self._make_field_lineage(
+                            dataset_urn,
+                            field_path_v1,
+                            upstream_urn,
+                            simplify_field_path(matching_upstream_field.fieldPath),
                         )
                     )
             return fine_grained_lineages

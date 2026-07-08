@@ -602,6 +602,7 @@ def test_resource_link_no_self_lineage_when_owner_unresolved():
 
     assert lineage.upstreams == []
     assert lineage.fine_grained_lineages == []
+    assert source.report.num_resource_link_self_referential == 1
 
 
 def test_resource_link_cll_gated_by_include_column_lineage():
@@ -843,6 +844,117 @@ def test_catalog_to_platform_instance_accepts_govcloud_arn():
     assert (
         source._resolve_platform_instance("111122223333").platform_instance
         == "gov_owner"
+    )
+
+
+def test_catalog_to_platform_instance_accepts_china_arn():
+    # The China partition (aws-cn / cn-* regions) must validate and resolve just like GovCloud.
+    source = GlueSource(
+        ctx=PipelineContext(run_id="glue-source-test"),
+        config=GlueSourceConfig(
+            aws_region="cn-north-1",
+            platform_instance="ingestion",
+            catalog_to_platform_instance={
+                "arn:aws-cn:glue:cn-north-1:111122223333": {
+                    "platform_instance": "cn_owner"
+                },
+            },
+        ),
+    )
+    assert (
+        source._resolve_platform_instance("111122223333").platform_instance
+        == "cn_owner"
+    )
+
+
+def test_catalog_to_platform_instance_rejects_partition_region_mismatch():
+    # The commercial `aws` partition with a GovCloud region is internally inconsistent: the lookup
+    # derives the partition from the region (aws-us-gov), so this key would never match. Reject it
+    # at config load rather than silently falling back to the wrong instance.
+    with pytest.raises(pydantic.ValidationError):
+        GlueSourceConfig(
+            aws_region="us-gov-west-1",
+            catalog_to_platform_instance={
+                "arn:aws:glue:us-gov-west-1:111122223333": {"platform_instance": "x"},
+            },
+        )
+
+
+def test_resource_link_schema_resolve_failure_reported():
+    # A missing cross-account glue:GetTable permission (ClientError) must be reported and counted,
+    # and the link ingested schemaless rather than crashing.
+    source = GlueSource(
+        ctx=PipelineContext(run_id="glue-source-test"),
+        config=GlueSourceConfig(aws_region="us-east-1"),
+    )
+    with Stubber(source.glue_client) as stubber:
+        stubber.add_client_error(
+            "get_table", service_error_code="AccessDeniedException"
+        )
+        result = source._populate_resource_link_schema(
+            dict(resource_link_table_in_mixed_database)
+        )
+    assert not result.get("StorageDescriptor", {}).get("Columns")
+    assert source.report.num_resource_link_schema_resolve_failed == 1
+    assert source.report.warnings
+
+
+def test_resource_link_schema_unavailable_reported():
+    # The target table returning no StorageDescriptor must be reported and counted.
+    source = GlueSource(
+        ctx=PipelineContext(run_id="glue-source-test"),
+        config=GlueSourceConfig(aws_region="us-east-1"),
+    )
+    with Stubber(source.glue_client) as stubber:
+        stubber.add_response(
+            "get_table",
+            {"Table": {"Name": "transactions"}},
+            {
+                "DatabaseName": "test-database",
+                "Name": "transactions",
+                "CatalogId": "432143214321",
+            },
+        )
+        result = source._populate_resource_link_schema(
+            dict(resource_link_table_in_mixed_database)
+        )
+    assert not result.get("StorageDescriptor", {}).get("Columns")
+    assert source.report.num_resource_link_schema_unavailable == 1
+    assert source.report.warnings
+
+
+def test_dataflow_node_uses_source_catalog_id_fallback():
+    # A job that reads via from_catalog() with no explicit catalog_id, when the whole source targets
+    # a cross-account catalog_id, must still stamp the owning instance (fallback to source catalog).
+    source = GlueSource(
+        ctx=PipelineContext(run_id="glue-source-test"),
+        config=GlueSourceConfig(
+            aws_region="us-east-1",
+            platform_instance="ingestion",
+            catalog_id="432143214321",
+            catalog_to_platform_instance={
+                "arn:aws:glue:us-east-1:432143214321": {
+                    "platform_instance": "owner_inst"
+                },
+            },
+        ),
+    )
+    node = {
+        "NodeType": "DataSource",
+        "Id": "DataSource0",
+        "Args": [
+            {"Name": "database", "Value": '"test-database"', "Param": False},
+            {"Name": "table_name", "Value": '"transactions"', "Param": False},
+        ],
+    }
+
+    result = source.process_dataflow_node(
+        node, "urn:li:dataFlow:(urn:li:dataPlatform:glue,flow,PROD)"
+    )
+
+    assert result is not None
+    assert result["urn"] == (
+        "urn:li:dataset:(urn:li:dataPlatform:glue,owner_inst.test-database.transactions,PROD)"
     )
 
 
