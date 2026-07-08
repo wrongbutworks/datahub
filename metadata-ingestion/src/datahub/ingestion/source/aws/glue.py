@@ -149,10 +149,11 @@ VALID_PLATFORMS = [DEFAULT_PLATFORM, "athena"]
 
 GLUE_TABLE_TYPE_ICEBERG = "ICEBERG"
 
-# ARN authority of a Glue catalog: arn:aws:glue:{region}:{account}. Used as the key of
+# ARN authority of a Glue catalog: arn:{partition}:glue:{region}:{account}. Used as the key of
 # catalog_to_platform_instance; validated so a typo'd key fails at config load instead of
-# silently never matching and falling back to the wrong platform_instance.
-GLUE_CATALOG_ARN_PATTERN = re.compile(r"^arn:aws:glue:[^:\s]+:\d+$")
+# silently never matching and falling back to the wrong platform_instance. The partition segment
+# covers commercial (aws), GovCloud (aws-us-gov) and China (aws-cn); the account is 12 digits.
+GLUE_CATALOG_ARN_PATTERN = re.compile(r"^arn:aws(?:-us-gov|-cn)?:glue:[^:\s]+:\d{12}$")
 JDBC_PLATFORM_MAP: Dict[str, str] = {
     "postgresql": "postgres",
     "mysql": "mysql",
@@ -438,6 +439,9 @@ class GlueSourceReport(StaleEntityRemovalSourceReport):
     num_dataset_to_dataset_edges_in_job: int = 0
     num_dataset_invalid_delta_schema: int = 0
     num_dataset_valid_delta_schema: int = 0
+    num_resource_link_schema_resolve_failed: int = 0
+    num_resource_link_schema_unavailable: int = 0
+    num_resource_link_missing_target: int = 0
 
     def report_table_scanned(self) -> None:
         self.tables_scanned += 1
@@ -679,20 +683,29 @@ class GlueSource(StatefulIngestionSourceBase):
             return f"{prefix}:table/{database}/{table}"
         return f"{prefix}:database/{database}"
 
+    def _aws_partition(self) -> str:
+        """The ARN partition for the source's region (commercial, GovCloud, or China)."""
+        region = self.source_config.aws_region or ""
+        if region.startswith("us-gov-"):
+            return "aws-us-gov"
+        if region.startswith("cn-"):
+            return "aws-cn"
+        return "aws"
+
     def _resolve_platform_instance(self, catalog_id: Optional[str]) -> ResolvedTarget:
         """Resolve the platform_instance/env to stamp on a table owned by ``catalog_id``.
 
         Cross-account tables (a different ``catalog_id``, or Lake Formation shared tables) must be
         stamped with the *owning* account's instance so their URNs match what that account's own
         Glue ingestion emits — not the ingestion account's instance. The owning catalog is keyed by
-        its ARN authority ``arn:aws:glue:{region}:{account}`` (account + region; account alone is not
-        unique across regions), the same key the Spark/OpenLineage ``connections`` map uses. Falls
-        back to the source's own ``platform_instance``/``env`` when there is no mapping.
+        its ARN authority ``arn:{partition}:glue:{region}:{account}`` (account + region; account
+        alone is not unique across regions), the same key the Spark/OpenLineage ``connections`` map
+        uses. Falls back to the source's own ``platform_instance``/``env`` when there is no mapping.
         """
         instance = self.source_config.platform_instance
         env = self.env
         if catalog_id and self.source_config.catalog_to_platform_instance:
-            arn = f"arn:aws:glue:{self.source_config.aws_region}:{catalog_id}"
+            arn = f"arn:{self._aws_partition()}:glue:{self.source_config.aws_region}:{catalog_id}"
             detail = self.source_config.catalog_to_platform_instance.get(arn)
             if detail is not None:
                 if detail.platform_instance is not None:
@@ -724,6 +737,7 @@ class GlueSource(StatefulIngestionSourceBase):
                 **{k: v for k, v in kwargs.items() if v}
             )
         except Exception as e:
+            self.report.num_resource_link_schema_resolve_failed += 1
             self.report.warning(
                 title="Failed to resolve resource link schema",
                 message="The shared table will be ingested without a schema. Check that the "
@@ -736,6 +750,13 @@ class GlueSource(StatefulIngestionSourceBase):
 
         storage_descriptor = response.get("Table", {}).get("StorageDescriptor")
         if not storage_descriptor:
+            self.report.num_resource_link_schema_unavailable += 1
+            self.report.warning(
+                title="Resource link target has no schema",
+                message="The target table returned no StorageDescriptor, so the shared table will "
+                "be ingested without a schema.",
+                context=f"{table.get('DatabaseName')}.{table.get('Name')} -> {target}",
+            )
             return table
         return {**table, "StorageDescriptor": storage_descriptor}
 
@@ -764,6 +785,7 @@ class GlueSource(StatefulIngestionSourceBase):
         database_name = target.get("DatabaseName")
         name = target.get("Name")
         if not database_name or not name:
+            self.report.num_resource_link_missing_target += 1
             self.report.warning(
                 title="Resource link missing target identifiers",
                 message="A Lake Formation resource link's TargetTable is missing its database or "
@@ -780,20 +802,43 @@ class GlueSource(StatefulIngestionSourceBase):
             env=owner.env,
             platform_instance=owner.platform_instance,
         )
-        # Identity column mapping: the link and its target share the same schema, so pass the link's
-        # own schema for both sides. Only possible when the schema was backfilled; skipped otherwise.
-        fine_grained_lineages = (
-            self.get_fine_grained_lineages(
-                dataset_urn, owner_urn, schema_metadata, schema_metadata
+        if owner_urn == dataset_urn:
+            # No catalog mapping resolved the owner to a distinct instance and the link/target names
+            # coincide, so the owner URN is the dataset's own URN — a self-upstream edge is
+            # meaningless. Skip it (a mapping for the owning catalog is what makes them distinct).
+            logger.debug(
+                f"Skipping self-referential resource-link lineage for {dataset_urn} "
+                f"(no catalog mapping for target {target.get('CatalogId')})"
             )
-            if schema_metadata
-            else None
-        )
+            return ResourceLinkLineage(upstreams=[], fine_grained_lineages=[])
+
+        # Identity column lineage: the link and its target are the same physical table, so each
+        # column maps 1:1 to the identically named owner column. Gated on include_column_lineage
+        # (consistent with the storage-lineage path) and only possible once the schema is backfilled.
+        fine_grained_lineages: List[FineGrainedLineageClass] = []
+        if self.source_config.include_column_lineage and schema_metadata:
+            fine_grained_lineages = [
+                FineGrainedLineageClass(
+                    downstreamType=FineGrainedLineageDownstreamTypeClass.FIELD,
+                    downstreams=[
+                        mce_builder.make_schema_field_urn(
+                            dataset_urn, Dataset._simplify_field_path(field.fieldPath)
+                        )
+                    ],
+                    upstreamType=FineGrainedLineageUpstreamTypeClass.FIELD_SET,
+                    upstreams=[
+                        mce_builder.make_schema_field_urn(
+                            owner_urn, Dataset._simplify_field_path(field.fieldPath)
+                        )
+                    ],
+                )
+                for field in schema_metadata.fields
+            ]
         return ResourceLinkLineage(
             upstreams=[
                 UpstreamClass(dataset=owner_urn, type=DatasetLineageTypeClass.COPY)
             ],
-            fine_grained_lineages=fine_grained_lineages or [],
+            fine_grained_lineages=fine_grained_lineages,
         )
 
     @classmethod
@@ -1510,14 +1555,28 @@ class GlueSource(StatefulIngestionSourceBase):
         return all_databases, all_tables
 
     def get_lineage_if_enabled(
-        self, mce: MetadataChangeEventClass
-    ) -> Optional[MetadataWorkUnit]:
+        self,
+        mce: MetadataChangeEventClass,
+        extra_upstreams: Optional[List[UpstreamClass]] = None,
+        extra_fine_grained_lineages: Optional[List[FineGrainedLineageClass]] = None,
+    ) -> Iterable[MetadataWorkUnit]:
+        """Emit the dataset's UpstreamLineage, combining storage lineage with any ``extra_*`` edges.
+
+        This method is the single owner of the dataset's own ``UpstreamLineage`` aspect: callers pass
+        additional upstream edges (e.g. Lake Formation resource-link lineage) and this method folds
+        them into the one aspect that targets ``dataset_urn`` — so two independent sources can't emit
+        two full-replace aspects on the same URN and clobber each other.
+        """
+        dataset_urn = mce.proposedSnapshot.urn
+        extra_upstreams = extra_upstreams or []
+        extra_fine_grained_lineages = extra_fine_grained_lineages or []
+
+        storage_upstreams: List[UpstreamClass] = []
+        storage_fine_grained: List[FineGrainedLineageClass] = []
         if self.source_config.emit_storage_lineage:
-            # extract dataset properties aspect
             dataset_properties: Optional[DatasetPropertiesClass] = (
                 mce_builder.get_aspect_if_available(mce, DatasetPropertiesClass)
             )
-            # extract dataset schema aspect
             schema_metadata: Optional[SchemaMetadataClass] = (
                 mce_builder.get_aspect_if_available(mce, SchemaMetadataClass)
             )
@@ -1529,7 +1588,7 @@ class GlueSource(StatefulIngestionSourceBase):
                 and dataset_properties.customProperties.get("table_type")
                 == GLUE_TABLE_TYPE_ICEBERG
             ):
-                table_storage_urn = mce.proposedSnapshot.urn.replace(
+                table_storage_urn = dataset_urn.replace(
                     "urn:li:dataPlatform:glue", "urn:li:dataPlatform:iceberg"
                 )
             elif (
@@ -1541,52 +1600,54 @@ class GlueSource(StatefulIngestionSourceBase):
                         location, self.source_config.env
                     )
 
-            # generate lineage
             if table_storage_urn:
                 if self.source_config.glue_storage_lineage_direction == "upstream":
-                    if self.ctx.graph:
-                        schema_metadata_for_upstream = (
-                            self.ctx.graph.get_schema_metadata(table_storage_urn)
-                        )
-                    else:
-                        schema_metadata_for_upstream = None
-
-                    fine_grained_lineages = None
+                    schema_metadata_for_upstream = (
+                        self.ctx.graph.get_schema_metadata(table_storage_urn)
+                        if self.ctx.graph
+                        else None
+                    )
                     if self.source_config.include_column_lineage and schema_metadata:
-                        fine_grained_lineages = self.get_fine_grained_lineages(
-                            mce.proposedSnapshot.urn,
-                            table_storage_urn,
-                            schema_metadata,
-                            schema_metadata_for_upstream or schema_metadata,
+                        storage_fine_grained = (
+                            self.get_fine_grained_lineages(
+                                dataset_urn,
+                                table_storage_urn,
+                                schema_metadata,
+                                schema_metadata_for_upstream or schema_metadata,
+                            )
+                            or []
                         )
-                    upstream_lineage = UpstreamLineageClass(
-                        upstreams=[
-                            UpstreamClass(
-                                dataset=table_storage_urn,
-                                type=DatasetLineageTypeClass.COPY,
-                            )
-                        ],
-                        fineGrainedLineages=fine_grained_lineages or None,
-                    )
-                    return MetadataChangeProposalWrapper(
-                        entityUrn=mce.proposedSnapshot.urn,
-                        aspect=upstream_lineage,
-                    ).as_workunit()
+                    storage_upstreams = [
+                        UpstreamClass(
+                            dataset=table_storage_urn,
+                            type=DatasetLineageTypeClass.COPY,
+                        )
+                    ]
                 else:
-                    # Need to mint the s3 dataset with upstream lineage from it to glue
-                    upstream_lineage = UpstreamLineageClass(
-                        upstreams=[
-                            UpstreamClass(
-                                dataset=mce.proposedSnapshot.urn,
-                                type=DatasetLineageTypeClass.COPY,
-                            )
-                        ]
-                    )
-                    return MetadataChangeProposalWrapper(
+                    # Downstream direction: the storage edge lives on the S3 dataset's own URN, so it
+                    # never collides with dataset_urn's aspect — emit it standalone.
+                    yield MetadataChangeProposalWrapper(
                         entityUrn=table_storage_urn,
-                        aspect=upstream_lineage,
+                        aspect=UpstreamLineageClass(
+                            upstreams=[
+                                UpstreamClass(
+                                    dataset=dataset_urn,
+                                    type=DatasetLineageTypeClass.COPY,
+                                )
+                            ]
+                        ),
                     ).as_workunit()
-        return None
+
+        upstreams = storage_upstreams + extra_upstreams
+        if upstreams:
+            fine_grained = storage_fine_grained + extra_fine_grained_lineages
+            yield MetadataChangeProposalWrapper(
+                entityUrn=dataset_urn,
+                aspect=UpstreamLineageClass(
+                    upstreams=upstreams,
+                    fineGrainedLineages=fine_grained or None,
+                ),
+            ).as_workunit()
 
     def get_fine_grained_lineages(
         self,
@@ -2125,38 +2186,13 @@ class GlueSource(StatefulIngestionSourceBase):
         if self.source_config.extract_column_parameters:
             yield from self._get_column_param_workunits(table, dataset_urn)
 
-        # Add lineage if enabled. Storage lineage and Lake Formation resource-link lineage both
-        # target this dataset's own URN with a full-replace UpstreamLineage aspect, so they must be
-        # merged into one aspect — emitting both separately would clobber whichever GMS applies last.
+        # Add lineage if enabled. get_lineage_if_enabled owns this dataset's UpstreamLineage aspect
+        # and folds the Lake Formation resource-link edges into the same aspect as storage lineage,
+        # so the two sources can't emit competing full-replace aspects and clobber each other.
         rl = self._resource_link_owner_lineage(table, dataset_urn, schema_metadata)
-        lineage_wu = self.get_lineage_if_enabled(metadata_record)
-        if (
-            lineage_wu is not None
-            and rl.upstreams
-            and isinstance(lineage_wu.metadata, MetadataChangeProposalWrapper)
-            and lineage_wu.metadata.entityUrn == dataset_urn
-            and isinstance(lineage_wu.metadata.aspect, UpstreamLineageClass)
-        ):
-            # Upstream-direction storage lineage lands on this dataset's URN — fold the owner edges in.
-            aspect = lineage_wu.metadata.aspect
-            aspect.upstreams = [*aspect.upstreams, *rl.upstreams]
-            aspect.fineGrainedLineages = [
-                *(aspect.fineGrainedLineages or []),
-                *rl.fine_grained_lineages,
-            ] or None
-            yield lineage_wu
-        else:
-            # Storage lineage is off or targets a different URN (downstream direction); emit each.
-            if lineage_wu is not None:
-                yield lineage_wu
-            if rl.upstreams:
-                yield MetadataChangeProposalWrapper(
-                    entityUrn=dataset_urn,
-                    aspect=UpstreamLineageClass(
-                        upstreams=rl.upstreams,
-                        fineGrainedLineages=rl.fine_grained_lineages or None,
-                    ),
-                ).as_workunit()
+        yield from self.get_lineage_if_enabled(
+            metadata_record, rl.upstreams, rl.fine_grained_lineages
+        )
 
         # Add profile if enabled
         try:

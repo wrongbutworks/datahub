@@ -415,6 +415,8 @@ def test_resource_link_emits_upstream_edge_to_owner():
         "urn:li:dataset:(urn:li:dataPlatform:glue,owner_inst.test-database.transactions,PROD)"
     ]
     assert lineage.upstreams[0].type == models.DatasetLineageTypeClass.COPY
+    # No schema was passed, so there is no column-level lineage to emit.
+    assert lineage.fine_grained_lineages == []
 
 
 def test_resource_link_owner_upstreams_handles_malformed_target():
@@ -436,6 +438,7 @@ def test_resource_link_owner_upstreams_handles_malformed_target():
 
     assert lineage.upstreams == []
     assert source.report.warnings
+    assert source.report.num_resource_link_missing_target == 1
 
 
 def test_resource_link_column_lineage_is_identity_mapping():
@@ -551,11 +554,226 @@ def test_resource_link_upstream_merged_with_storage_lineage():
     assert any("dataPlatform:s3" in d for d in datasets)
 
 
-def test_resolve_resource_link_schema_defaults_to_false():
-    # Backfilling a resource link's schema issues an extra cross-account glue:GetTable call and
-    # needs a new IAM permission, so it must be opt-in like the other extra-API-call flags.
+def test_resource_link_schema_not_fetched_when_disabled():
+    # With the default (resolve_resource_link_schema=False) a resource link must NOT trigger a
+    # cross-account glue:GetTable backfill — it is ingested schemaless, relying on the owner
+    # account's own ingestion. If a get_table call were made, the Stubber (no get_table response
+    # registered) would raise.
+    source = GlueSource(
+        ctx=PipelineContext(run_id="glue-source-test"),
+        config=GlueSourceConfig(aws_region="us-east-1"),
+    )
+    assert source.source_config.resolve_resource_link_schema is False
+
+    with Stubber(source.glue_client) as stubber:
+        stubber.add_response(
+            "get_tables",
+            get_tables_response_for_mixed_database,
+            {"DatabaseName": "mixed-database"},
+        )
+        tables = list(source.get_tables_from_database({"Name": "mixed-database"}))
+        stubber.assert_no_pending_responses()
+
+    link = next(t for t in tables if t.get("TargetTable"))
+    assert not link.get("StorageDescriptor", {}).get("Columns")
+
+
+def test_resource_link_no_self_lineage_when_owner_unresolved():
+    # No catalog mapping -> the owner falls back to the source's own instance/env. If the link and
+    # its target share a name, the owner URN equals the dataset's own URN; a self-upstream edge is
+    # meaningless and must be skipped.
+    source = GlueSource(
+        ctx=PipelineContext(run_id="glue-source-test"),
+        config=GlueSourceConfig(aws_region="us-east-1", platform_instance="acct"),
+    )
+    table = {
+        "Name": "shared",
+        "DatabaseName": "db",
+        "CatalogId": "111122223333",
+        "TargetTable": {
+            "CatalogId": "111122223333",
+            "DatabaseName": "db",
+            "Name": "shared",
+        },
+    }
+    dataset_urn = "urn:li:dataset:(urn:li:dataPlatform:glue,acct.db.shared,PROD)"
+
+    lineage = source._resource_link_owner_lineage(table, dataset_urn, None)
+
+    assert lineage.upstreams == []
+    assert lineage.fine_grained_lineages == []
+
+
+def test_resource_link_cll_gated_by_include_column_lineage():
+    # A backfilled resource link with include_column_lineage disabled keeps the table-level owner
+    # edge but emits no column-level lineage, matching the storage-lineage path's gating.
+    source = GlueSource(
+        ctx=PipelineContext(run_id="glue-source-test"),
+        config=GlueSourceConfig(
+            aws_region="us-east-1",
+            platform_instance="consumer_inst",
+            include_column_lineage=False,
+            use_s3_bucket_tags=False,
+            use_s3_object_tags=False,
+            catalog_to_platform_instance={
+                "arn:aws:glue:us-east-1:432143214321": {
+                    "platform_instance": "owner_inst"
+                },
+            },
+        ),
+    )
+    table = {
+        "Name": "shared-transactions",
+        "DatabaseName": "mixed-database",
+        "CatalogId": "123412341234",
+        "TargetTable": {
+            "CatalogId": "432143214321",
+            "DatabaseName": "test-database",
+            "Name": "transactions",
+        },
+        "StorageDescriptor": {
+            "Columns": [{"Name": "txn_id", "Type": "bigint", "Comment": ""}],
+            "Location": "s3://owner-bucket/transactions",
+        },
+    }
+
+    upstream_aspects = [
+        wu.metadata.aspect
+        for wu in source._gen_table_wu(table)
+        if isinstance(wu.metadata, MetadataChangeProposalWrapper)
+        and isinstance(wu.metadata.aspect, models.UpstreamLineageClass)
+    ]
+    assert len(upstream_aspects) == 1
+    assert upstream_aspects[0].upstreams  # table-level owner edge still present
+    assert not upstream_aspects[0].fineGrainedLineages
+
+
+def test_resource_link_and_storage_column_lineage_both_survive_merge():
+    # When storage lineage AND resource-link lineage both apply to a link, the single merged
+    # UpstreamLineage aspect must retain BOTH sets of column edges (S3 storage + owner identity),
+    # not clobber one with the other.
+    source = GlueSource(
+        ctx=PipelineContext(run_id="glue-source-test"),
+        config=GlueSourceConfig(
+            aws_region="us-east-1",
+            platform_instance="consumer_inst",
+            emit_storage_lineage=True,
+            include_column_lineage=True,
+            use_s3_bucket_tags=False,
+            use_s3_object_tags=False,
+            catalog_to_platform_instance={
+                "arn:aws:glue:us-east-1:432143214321": {
+                    "platform_instance": "owner_inst"
+                },
+            },
+        ),
+    )
+    table = {
+        "Name": "shared-transactions",
+        "DatabaseName": "mixed-database",
+        "CatalogId": "123412341234",
+        "TargetTable": {
+            "CatalogId": "432143214321",
+            "DatabaseName": "test-database",
+            "Name": "transactions",
+        },
+        "StorageDescriptor": {
+            "Columns": [
+                {"Name": "txn_id", "Type": "bigint", "Comment": ""},
+                {"Name": "amount", "Type": "double", "Comment": ""},
+            ],
+            "Location": "s3://owner-bucket/transactions",
+        },
+    }
+
+    upstream_aspects = [
+        wu.metadata.aspect
+        for wu in source._gen_table_wu(table)
+        if isinstance(wu.metadata, MetadataChangeProposalWrapper)
+        and isinstance(wu.metadata.aspect, models.UpstreamLineageClass)
+    ]
+    assert len(upstream_aspects) == 1
+    datasets = {u.dataset for u in upstream_aspects[0].upstreams}
+    assert any("owner_inst" in d for d in datasets)
+    assert any("dataPlatform:s3" in d for d in datasets)
+
+    fgl_upstreams = {
+        u
+        for fgl in (upstream_aspects[0].fineGrainedLineages or [])
+        for u in (fgl.upstreams or [])
+    }
+    assert any("owner_inst" in u for u in fgl_upstreams)  # owner identity column edges
+    assert any("dataPlatform:s3" in u for u in fgl_upstreams)  # storage column edges
+
+
+def test_resource_link_downstream_direction_emits_separate_dataset_aspect():
+    # In downstream storage-lineage mode the storage aspect targets the S3 URN, so the resource-link
+    # owner edge must be emitted as its own aspect on the dataset URN (no clobber, no merge).
+    source = GlueSource(
+        ctx=PipelineContext(run_id="glue-source-test"),
+        config=GlueSourceConfig(
+            aws_region="us-east-1",
+            platform_instance="consumer_inst",
+            emit_storage_lineage=True,
+            glue_storage_lineage_direction="downstream",
+            include_column_lineage=False,
+            use_s3_bucket_tags=False,
+            use_s3_object_tags=False,
+            catalog_to_platform_instance={
+                "arn:aws:glue:us-east-1:432143214321": {
+                    "platform_instance": "owner_inst"
+                },
+            },
+        ),
+    )
+    table = {
+        "Name": "shared-transactions",
+        "DatabaseName": "mixed-database",
+        "CatalogId": "123412341234",
+        "TargetTable": {
+            "CatalogId": "432143214321",
+            "DatabaseName": "test-database",
+            "Name": "transactions",
+        },
+        "StorageDescriptor": {
+            "Columns": [{"Name": "txn_id", "Type": "bigint", "Comment": ""}],
+            "Location": "s3://owner-bucket/transactions",
+        },
+    }
+
+    by_entity = {
+        wu.metadata.entityUrn: wu.metadata.aspect
+        for wu in source._gen_table_wu(table)
+        if isinstance(wu.metadata, MetadataChangeProposalWrapper)
+        and isinstance(wu.metadata.aspect, models.UpstreamLineageClass)
+    }
+    dataset_urn = "urn:li:dataset:(urn:li:dataPlatform:glue,consumer_inst.mixed-database.shared-transactions,PROD)"
+    # One aspect on the S3 URN (storage downstream) and one on the dataset URN (resource link).
+    assert any(e and "dataPlatform:s3" in e for e in by_entity)
+    assert dataset_urn in by_entity
+    assert [u.dataset for u in by_entity[dataset_urn].upstreams] == [
+        "urn:li:dataset:(urn:li:dataPlatform:glue,owner_inst.test-database.transactions,PROD)"
+    ]
+
+
+def test_catalog_to_platform_instance_accepts_govcloud_arn():
+    # GovCloud/China ARNs use non-`aws` partitions; a catalog ARN in those partitions must both
+    # validate and resolve.
+    source = GlueSource(
+        ctx=PipelineContext(run_id="glue-source-test"),
+        config=GlueSourceConfig(
+            aws_region="us-gov-west-1",
+            platform_instance="ingestion",
+            catalog_to_platform_instance={
+                "arn:aws-us-gov:glue:us-gov-west-1:111122223333": {
+                    "platform_instance": "gov_owner"
+                },
+            },
+        ),
+    )
     assert (
-        GlueSourceConfig(aws_region="us-east-1").resolve_resource_link_schema is False
+        source._resolve_platform_instance("111122223333").platform_instance
+        == "gov_owner"
     )
 
 
