@@ -554,6 +554,37 @@ def test_resource_link_upstream_merged_with_storage_lineage():
     assert any("dataPlatform:s3" in d for d in datasets)
 
 
+def _schema_metadata_of(wus: List) -> Optional[models.SchemaMetadataClass]:
+    for wu in wus:
+        if isinstance(wu.metadata, models.MetadataChangeEventClass):
+            for aspect in wu.metadata.proposedSnapshot.aspects:
+                if isinstance(aspect, models.SchemaMetadataClass):
+                    return aspect
+    return None
+
+
+def _owner_schema_metadata() -> models.SchemaMetadataClass:
+    return models.SchemaMetadataClass(
+        schemaName="test-database.transactions",
+        platform="urn:li:dataPlatform:glue",
+        version=0,
+        hash="",
+        platformSchema=models.MySqlDDLClass(tableSchema=""),
+        fields=[
+            models.SchemaFieldClass(
+                fieldPath="txn_id",
+                type=models.SchemaFieldDataTypeClass(type=models.NumberTypeClass()),
+                nativeDataType="bigint",
+            ),
+            models.SchemaFieldClass(
+                fieldPath="amount",
+                type=models.SchemaFieldDataTypeClass(type=models.NumberTypeClass()),
+                nativeDataType="double",
+            ),
+        ],
+    )
+
+
 def test_resource_link_schema_not_fetched_when_disabled():
     # With the default (resolve_resource_link_schema=False) a resource link must NOT trigger a
     # cross-account glue:GetTable backfill — it is ingested schemaless, relying on the owner
@@ -561,21 +592,130 @@ def test_resource_link_schema_not_fetched_when_disabled():
     # registered) would raise.
     source = GlueSource(
         ctx=PipelineContext(run_id="glue-source-test"),
-        config=GlueSourceConfig(aws_region="us-east-1"),
+        config=GlueSourceConfig(
+            aws_region="us-east-1",
+            use_s3_bucket_tags=False,
+            use_s3_object_tags=False,
+        ),
     )
     assert source.source_config.resolve_resource_link_schema is False
 
     with Stubber(source.glue_client) as stubber:
-        stubber.add_response(
-            "get_tables",
-            get_tables_response_for_mixed_database,
-            {"DatabaseName": "mixed-database"},
-        )
-        tables = list(source.get_tables_from_database({"Name": "mixed-database"}))
+        wus = list(source._gen_table_wu(dict(resource_link_table_in_mixed_database)))
         stubber.assert_no_pending_responses()
 
-    link = next(t for t in tables if t.get("TargetTable"))
-    assert not link.get("StorageDescriptor", {}).get("Columns")
+    assert _schema_metadata_of(wus) is None
+
+
+def test_resource_link_schema_resolved_from_graph():
+    # When the owner table is already in DataHub, resolve the link's schema from the graph — no
+    # cross-account glue:GetTable call (the Stubber has no get_table response, so a call would raise).
+    graph = MagicMock(spec=DataHubGraph)
+    graph.get_schema_metadata.return_value = _owner_schema_metadata()
+    source = GlueSource(
+        ctx=PipelineContext(run_id="glue-source-test", graph=graph),
+        config=GlueSourceConfig(
+            aws_region="us-east-1",
+            platform_instance="consumer_inst",
+            resolve_resource_link_schema=True,
+            use_s3_bucket_tags=False,
+            use_s3_object_tags=False,
+            catalog_to_platform_instance={
+                "arn:aws:glue:us-east-1:432143214321": {
+                    "platform_instance": "owner_inst"
+                },
+            },
+        ),
+    )
+
+    with Stubber(source.glue_client) as stubber:
+        wus = list(source._gen_table_wu(dict(resource_link_table_in_mixed_database)))
+        stubber.assert_no_pending_responses()
+
+    schema = _schema_metadata_of(wus)
+    assert schema is not None
+    assert {f.fieldPath for f in schema.fields} == {"txn_id", "amount"}
+    graph.get_schema_metadata.assert_called_once_with(
+        "urn:li:dataset:(urn:li:dataPlatform:glue,owner_inst.test-database.transactions,PROD)"
+    )
+    assert source.report.num_resource_link_schema_from_graph == 1
+
+
+def test_resource_link_schema_from_graph_is_cached():
+    # A table shared into many consumer DBs must be fetched from GMS only once.
+    graph = MagicMock(spec=DataHubGraph)
+    graph.get_schema_metadata.return_value = _owner_schema_metadata()
+    source = GlueSource(
+        ctx=PipelineContext(run_id="glue-source-test", graph=graph),
+        config=GlueSourceConfig(
+            aws_region="us-east-1",
+            platform_instance="consumer_inst",
+            resolve_resource_link_schema=True,
+            use_s3_bucket_tags=False,
+            use_s3_object_tags=False,
+            catalog_to_platform_instance={
+                "arn:aws:glue:us-east-1:432143214321": {
+                    "platform_instance": "owner_inst"
+                },
+            },
+        ),
+    )
+
+    with Stubber(source.glue_client):
+        list(source._gen_table_wu(dict(resource_link_table_in_mixed_database)))
+        list(source._gen_table_wu(dict(resource_link_table_in_mixed_database)))
+
+    assert graph.get_schema_metadata.call_count == 1
+    assert source.report.num_resource_link_schema_from_graph == 2
+
+
+def test_resource_link_schema_falls_back_to_glue_on_graph_miss():
+    # The owner isn't in DataHub yet (graph returns None) -> fall back to glue:GetTable.
+    graph = MagicMock(spec=DataHubGraph)
+    graph.get_schema_metadata.return_value = None
+    source = GlueSource(
+        ctx=PipelineContext(run_id="glue-source-test", graph=graph),
+        config=GlueSourceConfig(
+            aws_region="us-east-1",
+            platform_instance="consumer_inst",
+            resolve_resource_link_schema=True,
+            use_s3_bucket_tags=False,
+            use_s3_object_tags=False,
+            catalog_to_platform_instance={
+                "arn:aws:glue:us-east-1:432143214321": {
+                    "platform_instance": "owner_inst"
+                },
+            },
+        ),
+    )
+
+    with Stubber(source.glue_client) as stubber:
+        stubber.add_response(
+            "get_table",
+            {
+                "Table": {
+                    "Name": "transactions",
+                    "StorageDescriptor": {
+                        "Columns": [
+                            {"Name": "txn_id", "Type": "bigint", "Comment": ""}
+                        ],
+                        "Location": "s3://owner-bucket/transactions",
+                    },
+                }
+            },
+            {
+                "DatabaseName": "test-database",
+                "Name": "transactions",
+                "CatalogId": "432143214321",
+            },
+        )
+        wus = list(source._gen_table_wu(dict(resource_link_table_in_mixed_database)))
+        stubber.assert_no_pending_responses()  # get_table WAS called (fallback)
+
+    schema = _schema_metadata_of(wus)
+    assert schema is not None
+    assert any("txn_id" in f.fieldPath for f in schema.fields)
+    assert source.report.num_resource_link_schema_from_graph == 0
 
 
 def test_resource_link_no_self_lineage_when_owner_unresolved():

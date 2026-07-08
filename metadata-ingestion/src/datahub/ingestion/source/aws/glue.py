@@ -1,3 +1,4 @@
+import copy
 import datetime
 import json
 import logging
@@ -375,12 +376,13 @@ class GlueSourceConfig(
     resolve_resource_link_schema: bool = Field(
         default=False,
         description=(
-            "When ingesting Lake Formation resource links (`ignore_resource_links=False`), fetch the "
-            "shared table's schema from its target table in the owning account, since the link "
-            "itself carries no columns. Requires `glue:GetTable` on the target table and issues one "
-            "extra API call per resource link, so it is opt-in. Best-effort: on error the link is "
-            "ingested without a schema. Leave disabled to rely on the owner account's own ingestion "
-            "for the schema instead."
+            "When ingesting Lake Formation resource links (`ignore_resource_links=False`), resolve "
+            "the shared table's schema, since the link itself carries no columns. The owner's "
+            "already-ingested schema is reused from DataHub when available; otherwise it is fetched "
+            "from the target table via `glue:GetTable` on the owning account (requires that "
+            "permission and issues one extra API call per link). Opt-in; best-effort — on error the "
+            "link is ingested without a schema. Leave disabled to rely purely on the owner account's "
+            "own ingestion (the link still stitches to it via lineage)."
         ),
     )
 
@@ -469,6 +471,7 @@ class GlueSourceReport(StaleEntityRemovalSourceReport):
     num_dataset_to_dataset_edges_in_job: int = 0
     num_dataset_invalid_delta_schema: int = 0
     num_dataset_valid_delta_schema: int = 0
+    num_resource_link_schema_from_graph: int = 0
     num_resource_link_schema_resolve_failed: int = 0
     num_resource_link_schema_unavailable: int = 0
     num_resource_link_missing_target: int = 0
@@ -566,6 +569,9 @@ class GlueSource(StatefulIngestionSourceBase):
         # Tracks which structured property definitions have been emitted this run
         # so each key's definition is only upserted once.
         self._seen_column_param_urns: Set[str] = set()
+        # Caches the owner table's schema (by URN) when resolving resource links from the graph, so
+        # a table shared into many consumer databases is fetched from GMS only once.
+        self._resource_link_owner_schema_cache: Dict[str, Optional[SchemaMetadata]] = {}
 
         self.platform_resource_repository: Optional[
             "GluePlatformResourceRepository"
@@ -784,6 +790,49 @@ class GlueSource(StatefulIngestionSourceBase):
             return table
         return {**table, "StorageDescriptor": storage_descriptor}
 
+    def _resource_link_owner_urn(self, target: Dict) -> Optional[str]:
+        """URN of the table a resource link points at, stamped with the owning catalog's instance."""
+        database_name = target.get("DatabaseName")
+        name = target.get("Name")
+        if not database_name or not name:
+            return None
+        owner = self._resolve_platform_instance(target.get("CatalogId"))
+        return make_dataset_urn_with_platform_instance(
+            platform=self.platform,
+            name=f"{database_name}.{name}",
+            env=owner.env,
+            platform_instance=owner.platform_instance,
+        )
+
+    def _resource_link_schema_from_graph(
+        self, table: Dict, table_name: str
+    ) -> Optional[SchemaMetadata]:
+        """Reuse the owner table's already-ingested schema (if present in DataHub) for a link.
+
+        The owner account's own Glue ingestion produces the canonical schema for the shared table,
+        so reading it from the graph avoids a cross-account glue:GetTable and guarantees the columns
+        (and their field paths, for column lineage) match the owner entity exactly. Returns None when
+        there is no graph, no resolvable owner, or the owner isn't ingested yet.
+        """
+        if not self.ctx.graph:
+            return None
+        target = table.get("TargetTable")
+        owner_urn = self._resource_link_owner_urn(target) if target else None
+        if not owner_urn:
+            return None
+        if owner_urn not in self._resource_link_owner_schema_cache:
+            self._resource_link_owner_schema_cache[owner_urn] = (
+                self.ctx.graph.get_schema_metadata(owner_urn)
+            )
+        owner_schema = self._resource_link_owner_schema_cache[owner_urn]
+        if owner_schema is None:
+            return None
+        self.report.num_resource_link_schema_from_graph += 1
+        # Copy so re-stamping the link's own name doesn't mutate the shared cached aspect.
+        link_schema = copy.deepcopy(owner_schema)
+        link_schema.schemaName = table_name
+        return link_schema
+
     def _resource_link_owner_lineage(
         self,
         table: Dict,
@@ -806,9 +855,8 @@ class GlueSource(StatefulIngestionSourceBase):
         if not target:
             return ResourceLinkLineage(upstreams=[], fine_grained_lineages=[])
 
-        database_name = target.get("DatabaseName")
-        name = target.get("Name")
-        if not database_name or not name:
+        owner_urn = self._resource_link_owner_urn(target)
+        if owner_urn is None:
             self.report.num_resource_link_missing_target += 1
             self.report.warning(
                 title="Resource link missing target identifiers",
@@ -819,13 +867,6 @@ class GlueSource(StatefulIngestionSourceBase):
             )
             return ResourceLinkLineage(upstreams=[], fine_grained_lineages=[])
 
-        owner = self._resolve_platform_instance(target.get("CatalogId"))
-        owner_urn = make_dataset_urn_with_platform_instance(
-            platform=self.platform,
-            name=f"{database_name}.{name}",
-            env=owner.env,
-            platform_instance=owner.platform_instance,
-        )
         if owner_urn == dataset_urn:
             # No catalog mapping resolved the owner to a distinct instance and the link/target names
             # coincide, so the owner URN is the dataset's own URN — a self-upstream edge is
@@ -1554,13 +1595,6 @@ class GlueSource(StatefulIngestionSourceBase):
                 and "TargetDatabase" in database
             ):
                 table["DatabaseName"] = database["Name"]
-            # Resource links carry no schema of their own; backfill it from the target table.
-            if (
-                not self.source_config.ignore_resource_links
-                and self.source_config.resolve_resource_link_schema
-                and "TargetTable" in table
-            ):
-                table = self._populate_resource_link_schema(table)
             yield table
 
     def get_all_databases_and_tables(
@@ -2101,6 +2135,18 @@ class GlueSource(StatefulIngestionSourceBase):
             f"extract record from table={table_name} for dataset={dataset_urn}"
         )
 
+        # For a Lake Formation resource link, resolve the shared table's schema. Prefer the owner's
+        # already-ingested schema from DataHub; otherwise backfill the raw StorageDescriptor from
+        # Glue, which also lets this link's dataset properties and storage lineage behave like a
+        # normal table. Skipped entirely unless resolve_resource_link_schema is enabled.
+        resource_link_schema: Optional[SchemaMetadata] = None
+        if "TargetTable" in table and self.source_config.resolve_resource_link_schema:
+            resource_link_schema = self._resource_link_schema_from_graph(
+                table, table_name
+            )
+            if resource_link_schema is None:
+                table = self._populate_resource_link_schema(table)
+
         # Create the main dataset snapshot
         dataset_properties = self._get_dataset_properties(table)
         dataset_snapshot = DatasetSnapshot(
@@ -2163,7 +2209,7 @@ class GlueSource(StatefulIngestionSourceBase):
             and self.source_config.propagate_lakeformation_tags
             else None
         )
-        schema_metadata = self._get_schema_metadata(
+        schema_metadata = resource_link_schema or self._get_schema_metadata(
             table,
             table_name,
             dataset_urn,
