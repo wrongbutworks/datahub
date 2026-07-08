@@ -1210,12 +1210,18 @@ class GlueSource(StatefulIngestionSourceBase):
             if "database" in node_args and "table_name" in node_args:
                 full_table_name = f"{node_args['database']}.{node_args['table_name']}"
 
-                # we know that the table will already be covered when ingesting Glue tables
+                # Stamp the owning catalog's instance/env so this URN matches the dataset entity
+                # emitted when ingesting Glue tables. A cross-account job reading via
+                # from_catalog(catalog_id=...) carries that catalog id in the node args; fall back
+                # to the source's own catalog_id, then to no mapping (the source's own instance).
+                resolved = self._resolve_platform_instance(
+                    node_args.get("catalog_id") or self.source_config.catalog_id
+                )
                 node_urn = make_dataset_urn_with_platform_instance(
                     platform=self.platform,
                     name=full_table_name,
-                    env=self.env,
-                    platform_instance=self.source_config.platform_instance,
+                    env=resolved.env,
+                    platform_instance=resolved.platform_instance,
                 )
 
             # if data object is S3 bucket

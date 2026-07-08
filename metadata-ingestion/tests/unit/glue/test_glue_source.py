@@ -756,6 +756,75 @@ def test_resource_link_downstream_direction_emits_separate_dataset_aspect():
     ]
 
 
+def test_dataflow_node_uses_owning_catalog_instance():
+    # A Glue ETL job that reads a cross-account table via from_catalog(catalog_id=...) surfaces the
+    # catalog id in the node args. The job's input/output dataset URN must be stamped with the
+    # owning account's instance so it matches the dataset entity's URN (built the same way).
+    source = GlueSource(
+        ctx=PipelineContext(run_id="glue-source-test"),
+        config=GlueSourceConfig(
+            aws_region="us-east-1",
+            platform_instance="ingestion",
+            catalog_to_platform_instance={
+                "arn:aws:glue:us-east-1:432143214321": {
+                    "platform_instance": "owner_inst"
+                },
+            },
+        ),
+    )
+    node = {
+        "NodeType": "DataSource",
+        "Id": "DataSource0",
+        "Args": [
+            {"Name": "database", "Value": '"test-database"', "Param": False},
+            {"Name": "table_name", "Value": '"transactions"', "Param": False},
+            {"Name": "catalog_id", "Value": '"432143214321"', "Param": False},
+        ],
+    }
+
+    result = source.process_dataflow_node(
+        node, "urn:li:dataFlow:(urn:li:dataPlatform:glue,flow,PROD)"
+    )
+
+    assert result is not None
+    assert result["urn"] == (
+        "urn:li:dataset:(urn:li:dataPlatform:glue,owner_inst.test-database.transactions,PROD)"
+    )
+
+
+def test_dataflow_node_without_catalog_id_uses_source_instance():
+    # No catalog id in the node args (the common case) -> the source's own instance, unchanged.
+    source = GlueSource(
+        ctx=PipelineContext(run_id="glue-source-test"),
+        config=GlueSourceConfig(
+            aws_region="us-east-1",
+            platform_instance="ingestion",
+            catalog_to_platform_instance={
+                "arn:aws:glue:us-east-1:432143214321": {
+                    "platform_instance": "owner_inst"
+                },
+            },
+        ),
+    )
+    node = {
+        "NodeType": "DataSource",
+        "Id": "DataSource0",
+        "Args": [
+            {"Name": "database", "Value": '"local-database"', "Param": False},
+            {"Name": "table_name", "Value": '"events"', "Param": False},
+        ],
+    }
+
+    result = source.process_dataflow_node(
+        node, "urn:li:dataFlow:(urn:li:dataPlatform:glue,flow,PROD)"
+    )
+
+    assert result is not None
+    assert result["urn"] == (
+        "urn:li:dataset:(urn:li:dataPlatform:glue,ingestion.local-database.events,PROD)"
+    )
+
+
 def test_catalog_to_platform_instance_accepts_govcloud_arn():
     # GovCloud/China ARNs use non-`aws` partitions; a catalog ARN in those partitions must both
     # validate and resolve.
