@@ -472,6 +472,11 @@ class GlueSourceReport(StaleEntityRemovalSourceReport):
     num_dataset_invalid_delta_schema: int = 0
     num_dataset_valid_delta_schema: int = 0
     num_resource_link_schema_from_graph: int = 0
+    num_resource_link_schema_from_glue: int = 0
+    # Per-link count of resource links that shipped schemaless via the Glue path (the true blast
+    # radius); resolve_failed/unavailable below are per distinct owner target (the cause).
+    num_resource_link_schema_missing: int = 0
+    num_resource_link_schema_graph_failed: int = 0
     num_resource_link_schema_resolve_failed: int = 0
     num_resource_link_schema_unavailable: int = 0
     num_resource_link_missing_target: int = 0
@@ -572,6 +577,9 @@ class GlueSource(StatefulIngestionSourceBase):
         # Caches the owner table's schema (by URN) when resolving resource links from the graph, so
         # a table shared into many consumer databases is fetched from GMS only once.
         self._resource_link_owner_schema_cache: Dict[str, Optional[SchemaMetadata]] = {}
+        # Same idea for the Glue fallback: cache the target's StorageDescriptor (by owner URN) so a
+        # shared table whose owner isn't in DataHub isn't re-fetched via glue:GetTable per link.
+        self._resource_link_owner_sd_cache: Dict[str, Optional[Dict]] = {}
 
         self.platform_resource_repository: Optional[
             "GluePlatformResourceRepository"
@@ -757,6 +765,28 @@ class GlueSource(StatefulIngestionSourceBase):
         if not target or table.get("StorageDescriptor", {}).get("Columns"):
             return table
 
+        # Cache the target's StorageDescriptor by owner URN so a shared table linked into many
+        # consumer databases only costs one glue:GetTable. A cached None is a negative result.
+        cache_key = self._resource_link_owner_urn(target)
+        if cache_key is None or cache_key not in self._resource_link_owner_sd_cache:
+            storage_descriptor = self._fetch_target_storage_descriptor(table, target)
+            if cache_key is not None:
+                self._resource_link_owner_sd_cache[cache_key] = storage_descriptor
+        else:
+            storage_descriptor = self._resource_link_owner_sd_cache[cache_key]
+
+        if not storage_descriptor:
+            # Counted per link (not per target) so the number reflects how many datasets actually
+            # shipped schemaless; the cause is diagnosed by the per-target counters/warnings above.
+            self.report.num_resource_link_schema_missing += 1
+            return table
+        self.report.num_resource_link_schema_from_glue += 1
+        return {**table, "StorageDescriptor": storage_descriptor}
+
+    def _fetch_target_storage_descriptor(
+        self, table: Dict, target: Dict
+    ) -> Optional[Dict]:
+        """glue:GetTable on a resource link's target, returning its StorageDescriptor (or None)."""
         kwargs = {
             "DatabaseName": target.get("DatabaseName"),
             "Name": target.get("Name"),
@@ -776,7 +806,7 @@ class GlueSource(StatefulIngestionSourceBase):
                 context=f"{table.get('DatabaseName')}.{table.get('Name')} -> {target}",
                 exc=e,
             )
-            return table
+            return None
 
         storage_descriptor = response.get("Table", {}).get("StorageDescriptor")
         if not storage_descriptor:
@@ -787,8 +817,8 @@ class GlueSource(StatefulIngestionSourceBase):
                 "be ingested without a schema.",
                 context=f"{table.get('DatabaseName')}.{table.get('Name')} -> {target}",
             )
-            return table
-        return {**table, "StorageDescriptor": storage_descriptor}
+            return None
+        return storage_descriptor
 
     def _resource_link_owner_urn(self, target: Dict) -> Optional[str]:
         """URN of the table a resource link points at, stamped with the owning catalog's instance."""
@@ -818,12 +848,26 @@ class GlueSource(StatefulIngestionSourceBase):
             return None
         target = table.get("TargetTable")
         owner_urn = self._resource_link_owner_urn(target) if target else None
-        if not owner_urn:
+        if owner_urn is None:
             return None
+        # Cache the owner's schema by URN. A stored value of None is a negative result — either the
+        # owner isn't ingested (get_schema_metadata returns None on 404) or the fetch errored — so
+        # look it up with `in`, not `.get()`, to keep a table shared into many DBs to one fetch.
         if owner_urn not in self._resource_link_owner_schema_cache:
-            self._resource_link_owner_schema_cache[owner_urn] = (
-                self.ctx.graph.get_schema_metadata(owner_urn)
-            )
+            try:
+                self._resource_link_owner_schema_cache[owner_urn] = (
+                    self.ctx.graph.get_schema_metadata(owner_urn)
+                )
+            except Exception as e:
+                # A transient GMS/network error must not abort the run; degrade to the Glue backfill.
+                self.report.num_resource_link_schema_graph_failed += 1
+                self.report.warning(
+                    title="Failed to read resource link owner schema from DataHub",
+                    message="Falling back to fetching the shared table's schema from Glue.",
+                    context=owner_urn,
+                    exc=e,
+                )
+                self._resource_link_owner_schema_cache[owner_urn] = None
         owner_schema = self._resource_link_owner_schema_cache[owner_urn]
         if owner_schema is None:
             return None

@@ -598,7 +598,6 @@ def test_resource_link_schema_not_fetched_when_disabled():
             use_s3_object_tags=False,
         ),
     )
-    assert source.source_config.resolve_resource_link_schema is False
 
     with Stubber(source.glue_client) as stubber:
         wus = list(source._gen_table_wu(dict(resource_link_table_in_mixed_database)))
@@ -640,9 +639,35 @@ def test_resource_link_schema_resolved_from_graph():
     )
     assert source.report.num_resource_link_schema_from_graph == 1
 
+    # Identity column lineage must also work on the graph-resolved path (not just the Glue path).
+    upstreams = [
+        wu.metadata.aspect
+        for wu in wus
+        if isinstance(wu.metadata, MetadataChangeProposalWrapper)
+        and isinstance(wu.metadata.aspect, models.UpstreamLineageClass)
+    ]
+    assert len(upstreams) == 1
+    consumer = "urn:li:dataset:(urn:li:dataPlatform:glue,consumer_inst.mixed-database.shared-transactions,PROD)"
+    owner = "urn:li:dataset:(urn:li:dataPlatform:glue,owner_inst.test-database.transactions,PROD)"
+    pairs = {
+        ((f.downstreams or [])[0], (f.upstreams or [])[0])
+        for f in (upstreams[0].fineGrainedLineages or [])
+    }
+    assert pairs == {
+        (
+            f"urn:li:schemaField:({consumer},txn_id)",
+            f"urn:li:schemaField:({owner},txn_id)",
+        ),
+        (
+            f"urn:li:schemaField:({consumer},amount)",
+            f"urn:li:schemaField:({owner},amount)",
+        ),
+    }
+
 
 def test_resource_link_schema_from_graph_is_cached():
-    # A table shared into many consumer DBs must be fetched from GMS only once.
+    # One owner table shared into two different consumer links must be fetched from GMS once, and
+    # each link's emitted schema must carry its OWN name (the deepcopy must not corrupt the cache).
     graph = MagicMock(spec=DataHubGraph)
     graph.get_schema_metadata.return_value = _owner_schema_metadata()
     source = GlueSource(
@@ -660,13 +685,174 @@ def test_resource_link_schema_from_graph_is_cached():
             },
         ),
     )
+    link_a = dict(resource_link_table_in_mixed_database)
+    link_b = {**dict(resource_link_table_in_mixed_database), "Name": "shared-txns-copy"}
 
     with Stubber(source.glue_client):
-        list(source._gen_table_wu(dict(resource_link_table_in_mixed_database)))
-        list(source._gen_table_wu(dict(resource_link_table_in_mixed_database)))
+        schema_a = _schema_metadata_of(list(source._gen_table_wu(link_a)))
+        schema_b = _schema_metadata_of(list(source._gen_table_wu(link_b)))
 
     assert graph.get_schema_metadata.call_count == 1
     assert source.report.num_resource_link_schema_from_graph == 2
+    # Each link re-stamps its own name on a copy; the cached owner aspect is not mutated/shared.
+    assert schema_a is not None and schema_b is not None
+    assert schema_a.schemaName == "mixed-database.shared-transactions"
+    assert schema_b.schemaName == "mixed-database.shared-txns-copy"
+
+
+def test_resource_link_schema_graph_error_falls_back_to_glue():
+    # A transient GMS error must not abort the run: it is reported and the Glue backfill is used.
+    graph = MagicMock(spec=DataHubGraph)
+    graph.get_schema_metadata.side_effect = Exception("gms unavailable")
+    source = GlueSource(
+        ctx=PipelineContext(run_id="glue-source-test", graph=graph),
+        config=GlueSourceConfig(
+            aws_region="us-east-1",
+            platform_instance="consumer_inst",
+            resolve_resource_link_schema=True,
+            use_s3_bucket_tags=False,
+            use_s3_object_tags=False,
+            catalog_to_platform_instance={
+                "arn:aws:glue:us-east-1:432143214321": {
+                    "platform_instance": "owner_inst"
+                },
+            },
+        ),
+    )
+
+    with Stubber(source.glue_client) as stubber:
+        stubber.add_response(
+            "get_table",
+            {
+                "Table": {
+                    "Name": "transactions",
+                    "StorageDescriptor": {
+                        "Columns": [
+                            {"Name": "txn_id", "Type": "bigint", "Comment": ""}
+                        ],
+                        "Location": "s3://owner-bucket/transactions",
+                    },
+                }
+            },
+            {
+                "DatabaseName": "test-database",
+                "Name": "transactions",
+                "CatalogId": "432143214321",
+            },
+        )
+        wus = list(source._gen_table_wu(dict(resource_link_table_in_mixed_database)))
+        stubber.assert_no_pending_responses()
+
+    schema = _schema_metadata_of(wus)
+    assert schema is not None
+    assert any("txn_id" in f.fieldPath for f in schema.fields)
+    assert source.report.num_resource_link_schema_graph_failed == 1
+    assert source.report.num_resource_link_schema_from_glue == 1
+    assert source.report.warnings
+
+
+def test_resource_link_schema_graph_error_is_cached():
+    # A GMS outage against a table shared into many links must not produce a failing graph call per
+    # link (thundering herd): the error result is cached, so the graph is hit once and every link
+    # degrades to the (also-cached) Glue backfill.
+    graph = MagicMock(spec=DataHubGraph)
+    graph.get_schema_metadata.side_effect = Exception("gms unavailable")
+    source = GlueSource(
+        ctx=PipelineContext(run_id="glue-source-test", graph=graph),
+        config=GlueSourceConfig(
+            aws_region="us-east-1",
+            platform_instance="consumer_inst",
+            resolve_resource_link_schema=True,
+            use_s3_bucket_tags=False,
+            use_s3_object_tags=False,
+            catalog_to_platform_instance={
+                "arn:aws:glue:us-east-1:432143214321": {
+                    "platform_instance": "owner_inst"
+                },
+            },
+        ),
+    )
+    link_a = dict(resource_link_table_in_mixed_database)
+    link_b = {**dict(resource_link_table_in_mixed_database), "Name": "shared-txns-copy"}
+
+    with Stubber(source.glue_client) as stubber:
+        # One get_table response: both the graph error and the Glue fetch are cached by owner URN.
+        stubber.add_response(
+            "get_table",
+            {
+                "Table": {
+                    "Name": "transactions",
+                    "StorageDescriptor": {
+                        "Columns": [
+                            {"Name": "txn_id", "Type": "bigint", "Comment": ""}
+                        ],
+                        "Location": "s3://owner-bucket/transactions",
+                    },
+                }
+            },
+            {
+                "DatabaseName": "test-database",
+                "Name": "transactions",
+                "CatalogId": "432143214321",
+            },
+        )
+        list(source._gen_table_wu(link_a))
+        list(source._gen_table_wu(link_b))
+        stubber.assert_no_pending_responses()
+
+    assert graph.get_schema_metadata.call_count == 1
+    assert source.report.num_resource_link_schema_graph_failed == 1
+    assert source.report.num_resource_link_schema_from_glue == 2
+
+
+def test_resource_link_glue_fallback_is_cached():
+    # Owner not in DataHub (graph miss) and shared into two links -> glue:GetTable fires once.
+    graph = MagicMock(spec=DataHubGraph)
+    graph.get_schema_metadata.return_value = None
+    source = GlueSource(
+        ctx=PipelineContext(run_id="glue-source-test", graph=graph),
+        config=GlueSourceConfig(
+            aws_region="us-east-1",
+            platform_instance="consumer_inst",
+            resolve_resource_link_schema=True,
+            use_s3_bucket_tags=False,
+            use_s3_object_tags=False,
+            catalog_to_platform_instance={
+                "arn:aws:glue:us-east-1:432143214321": {
+                    "platform_instance": "owner_inst"
+                },
+            },
+        ),
+    )
+    link_a = dict(resource_link_table_in_mixed_database)
+    link_b = {**dict(resource_link_table_in_mixed_database), "Name": "shared-txns-copy"}
+
+    with Stubber(source.glue_client) as stubber:
+        stubber.add_response(
+            "get_table",
+            {
+                "Table": {
+                    "Name": "transactions",
+                    "StorageDescriptor": {
+                        "Columns": [
+                            {"Name": "txn_id", "Type": "bigint", "Comment": ""}
+                        ],
+                        "Location": "s3://owner-bucket/transactions",
+                    },
+                }
+            },
+            {
+                "DatabaseName": "test-database",
+                "Name": "transactions",
+                "CatalogId": "432143214321",
+            },
+        )
+        # Only one get_table response registered: the second link must be served from cache.
+        list(source._gen_table_wu(link_a))
+        list(source._gen_table_wu(link_b))
+        stubber.assert_no_pending_responses()
+
+    assert source.report.num_resource_link_schema_from_glue == 2
 
 
 def test_resource_link_schema_falls_back_to_glue_on_graph_miss():
@@ -716,6 +902,7 @@ def test_resource_link_schema_falls_back_to_glue_on_graph_miss():
     assert schema is not None
     assert any("txn_id" in f.fieldPath for f in schema.fields)
     assert source.report.num_resource_link_schema_from_graph == 0
+    assert source.report.num_resource_link_schema_from_glue == 1
 
 
 def test_resource_link_no_self_lineage_when_owner_unresolved():
@@ -1059,7 +1246,41 @@ def test_resource_link_schema_resolve_failure_reported():
         )
     assert not result.get("StorageDescriptor", {}).get("Columns")
     assert source.report.num_resource_link_schema_resolve_failed == 1
+    assert source.report.num_resource_link_schema_missing == 1
     assert source.report.warnings
+
+
+def test_resource_link_schema_failure_blast_radius_is_per_link():
+    # One owner table whose glue:GetTable fails, shared into two links: the cause is counted once
+    # (per target, with one warning), but BOTH datasets are counted as shipped schemaless.
+    source = GlueSource(
+        ctx=PipelineContext(run_id="glue-source-test"),
+        config=GlueSourceConfig(
+            aws_region="us-east-1",
+            platform_instance="consumer_inst",
+            resolve_resource_link_schema=True,
+            use_s3_bucket_tags=False,
+            use_s3_object_tags=False,
+        ),
+    )
+    link_a = dict(resource_link_table_in_mixed_database)
+    link_b = {**dict(resource_link_table_in_mixed_database), "Name": "shared-txns-copy"}
+
+    with Stubber(source.glue_client) as stubber:
+        # Only one client error registered: the second link must be served from the negative cache.
+        stubber.add_client_error(
+            "get_table", service_error_code="AccessDeniedException"
+        )
+        list(source._gen_table_wu(link_a))
+        list(source._gen_table_wu(link_b))
+        stubber.assert_no_pending_responses()
+
+    assert (
+        source.report.num_resource_link_schema_resolve_failed == 1
+    )  # per distinct target
+    assert (
+        source.report.num_resource_link_schema_missing == 2
+    )  # per link (true blast radius)
 
 
 def test_resource_link_schema_unavailable_reported():
