@@ -9,11 +9,14 @@ import com.datahub.authentication.Actor;
 import com.datahub.authentication.ActorType;
 import com.datahub.authentication.Authentication;
 import com.datahub.authentication.AuthenticationContext;
+import com.datahub.authorization.AuthUtil;
 import com.datahub.authorization.AuthorizationResult;
 import com.datahub.authorization.AuthorizerChain;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.linkedin.gms.factory.config.ConfigurationProvider;
 import com.linkedin.metadata.aspect.models.graph.RelatedEntitiesScrollResult;
+import com.linkedin.metadata.authorization.ApiGroup;
+import com.linkedin.metadata.authorization.ApiOperation;
 import com.linkedin.metadata.graph.GraphFilters;
 import com.linkedin.metadata.graph.GraphService;
 import com.linkedin.metadata.graph.elastic.ElasticSearchGraphService;
@@ -36,6 +39,8 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Set;
 import org.mockito.ArgumentCaptor;
+import org.mockito.MockedStatic;
+import org.mockito.Mockito;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
@@ -1425,6 +1430,40 @@ public class RelationshipControllerTest extends AbstractTestNGSpringContextTests
                 .content(objectMapper.writeValueAsString(EMPTY_SCROLL_BODY))
                 .accept(MediaType.APPLICATION_JSON))
         .andExpect(status().is4xxClientError());
+  }
+
+  @Test
+  public void testScrollRelationshipsWithEntityUrnDeniedForEntity() throws Exception {
+    String entityUrn = "urn:li:dataset:(urn:li:dataPlatform:testPlatform,test,PROD)";
+    try (MockedStatic<AuthUtil> authUtilMock = Mockito.mockStatic(AuthUtil.class)) {
+      authUtilMock
+          .when(
+              () ->
+                  AuthUtil.isAPIAuthorized(
+                      any(OperationContext.class),
+                      eq(ApiGroup.RELATIONSHIP),
+                      eq(ApiOperation.READ)))
+          .thenReturn(true);
+      authUtilMock
+          .when(
+              () ->
+                  AuthUtil.isAPIAuthorizedUrns(
+                      any(OperationContext.class),
+                      eq(ApiGroup.RELATIONSHIP),
+                      eq(ApiOperation.READ),
+                      anyList()))
+          .thenReturn(false);
+
+      mockMvc
+          .perform(
+              MockMvcRequestBuilders.post("/openapi/v3/relationship/scroll")
+                  .param("entityUrn", entityUrn)
+                  .param("direction", "INCOMING")
+                  .contentType(MediaType.APPLICATION_JSON)
+                  .content(objectMapper.writeValueAsString(EMPTY_SCROLL_BODY))
+                  .accept(MediaType.APPLICATION_JSON))
+          .andExpect(status().isForbidden());
+    }
   }
 
   @Test
