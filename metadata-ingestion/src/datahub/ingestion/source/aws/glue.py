@@ -167,8 +167,8 @@ def _aws_partition_for_region(region: str) -> str:
     try:
         return botocore.session.get_session().get_partition_for_region(region)
     except botocore.exceptions.UnknownRegionError:
-        # A region botocore doesn't recognize (e.g. not-yet-published) — assume commercial rather
-        # than fail; a genuine botocore API change surfaces instead of silently degrading here.
+        # Only swallow UnknownRegionError, so a genuine botocore API change surfaces instead of
+        # silently degrading every region to the commercial partition.
         return "aws"
 
 
@@ -428,7 +428,8 @@ class GlueSourceConfig(
             raise ValueError(
                 "catalog_to_platform_instance keys must be Glue catalog ARN authorities of the "
                 "form arn:{partition}:glue:{region}:{account} (account + region), where the "
-                "partition matches the region (commercial=aws, GovCloud=aws-us-gov, China=aws-cn); "
+                "partition matches the region as resolved by boto3 (commercial=aws, "
+                "GovCloud=aws-us-gov, China=aws-cn, isolated regions=aws-iso*); "
                 f"invalid keys: {invalid}"
             )
         return v
@@ -727,8 +728,8 @@ class GlueSource(StatefulIngestionSourceBase):
         instance = self.source_config.platform_instance
         env = self.env
         if catalog_id and self.source_config.catalog_to_platform_instance:
-            partition = _aws_partition_for_region(self.source_config.aws_region or "")
-            arn = f"arn:{partition}:glue:{self.source_config.aws_region}:{catalog_id}"
+            region = self.source_config.aws_region or ""
+            arn = f"arn:{_aws_partition_for_region(region)}:glue:{region}:{catalog_id}"
             detail = self.source_config.catalog_to_platform_instance.get(arn)
             if detail is not None:
                 if detail.platform_instance is not None:
@@ -844,7 +845,6 @@ class GlueSource(StatefulIngestionSourceBase):
         fine_grained_lineages: List[FineGrainedLineageClass] = []
         if self.source_config.include_column_lineage and schema_metadata:
             for field in schema_metadata.fields:
-                # Same field on both sides — the link and its target are the same physical table.
                 path = Dataset._simplify_field_path(field.fieldPath)
                 fine_grained_lineages.append(
                     self._make_field_lineage(
@@ -2220,9 +2220,8 @@ class GlueSource(StatefulIngestionSourceBase):
         if self.source_config.extract_column_parameters:
             yield from self._get_column_param_workunits(table, dataset_urn)
 
-        # Add lineage if enabled. get_lineage_if_enabled owns this dataset's UpstreamLineage aspect
-        # and folds the Lake Formation resource-link edges into the same aspect as storage lineage,
-        # so the two sources can't emit competing full-replace aspects and clobber each other.
+        # Pass the resource-link edges to get_lineage_if_enabled so they merge with storage lineage
+        # into one aspect rather than being emitted as a competing one.
         rl = self._resource_link_owner_lineage(table, dataset_urn, schema_metadata)
         yield from self.get_lineage_if_enabled(
             metadata_record, rl.upstreams, rl.fine_grained_lineages
