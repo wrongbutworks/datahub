@@ -407,14 +407,14 @@ def test_resource_link_emits_upstream_edge_to_owner():
             },
         ),
     )
-    upstreams = source._resource_link_owner_upstreams(
-        resource_link_table_in_mixed_database
+    lineage = source._resource_link_owner_lineage(
+        resource_link_table_in_mixed_database, "urn:li:dataset:(consumer)", None
     )
 
-    assert [u.dataset for u in upstreams] == [
+    assert [u.dataset for u in lineage.upstreams] == [
         "urn:li:dataset:(urn:li:dataPlatform:glue,owner_inst.test-database.transactions,PROD)"
     ]
-    assert upstreams[0].type == models.DatasetLineageTypeClass.COPY
+    assert lineage.upstreams[0].type == models.DatasetLineageTypeClass.COPY
 
 
 def test_resource_link_owner_upstreams_handles_malformed_target():
@@ -430,10 +430,74 @@ def test_resource_link_owner_upstreams_handles_malformed_target():
         "TargetTable": {"CatalogId": "432143214321", "DatabaseName": "test-database"},
     }
 
-    upstreams = source._resource_link_owner_upstreams(malformed)
+    lineage = source._resource_link_owner_lineage(
+        malformed, "urn:li:dataset:(consumer)", None
+    )
 
-    assert upstreams == []
+    assert lineage.upstreams == []
     assert source.report.warnings
+
+
+def test_resource_link_column_lineage_is_identity_mapping():
+    # A resource link is the same physical table as its target, so once its schema is backfilled
+    # each column maps 1:1 to the identically-named owner column. Expect one FineGrainedLineage per
+    # column, pairing the consumer and owner schemaField URNs by field name.
+    source = GlueSource(
+        ctx=PipelineContext(run_id="glue-source-test"),
+        config=GlueSourceConfig(
+            aws_region="us-east-1",
+            platform_instance="consumer_inst",
+            use_s3_bucket_tags=False,
+            use_s3_object_tags=False,
+            catalog_to_platform_instance={
+                "arn:aws:glue:us-east-1:432143214321": {
+                    "platform_instance": "owner_inst"
+                },
+            },
+        ),
+    )
+    table = {
+        "Name": "shared-transactions",
+        "DatabaseName": "mixed-database",
+        "CatalogId": "123412341234",
+        "TargetTable": {
+            "CatalogId": "432143214321",
+            "DatabaseName": "test-database",
+            "Name": "transactions",
+        },
+        "StorageDescriptor": {
+            "Columns": [
+                {"Name": "txn_id", "Type": "bigint", "Comment": ""},
+                {"Name": "amount", "Type": "double", "Comment": ""},
+            ],
+            "Location": "s3://owner-bucket/transactions",
+        },
+    }
+
+    wus = list(source._gen_table_wu(table))
+    upstream_aspects = [
+        wu.metadata.aspect
+        for wu in wus
+        if isinstance(wu.metadata, MetadataChangeProposalWrapper)
+        and isinstance(wu.metadata.aspect, models.UpstreamLineageClass)
+    ]
+    assert len(upstream_aspects) == 1
+    fgls = upstream_aspects[0].fineGrainedLineages
+    assert fgls is not None and len(fgls) == 2
+
+    consumer = "urn:li:dataset:(urn:li:dataPlatform:glue,consumer_inst.mixed-database.shared-transactions,PROD)"
+    owner = "urn:li:dataset:(urn:li:dataPlatform:glue,owner_inst.test-database.transactions,PROD)"
+    pairs = {((fgl.downstreams or [])[0], (fgl.upstreams or [])[0]) for fgl in fgls}
+    assert pairs == {
+        (
+            f"urn:li:schemaField:({consumer},txn_id)",
+            f"urn:li:schemaField:({owner},txn_id)",
+        ),
+        (
+            f"urn:li:schemaField:({consumer},amount)",
+            f"urn:li:schemaField:({owner},amount)",
+        ),
+    }
 
 
 def test_resource_link_upstream_merged_with_storage_lineage():

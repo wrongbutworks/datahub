@@ -216,6 +216,14 @@ class ResolvedTarget:
     env: str
 
 
+@dataclass
+class ResourceLinkLineage:
+    """Lineage from a Lake Formation resource link to its owning (target) table."""
+
+    upstreams: List[UpstreamClass]
+    fine_grained_lineages: List[FineGrainedLineageClass]
+
+
 class GlueSourceConfig(
     StatefulIngestionConfigBase,
     DatasetSourceConfigMixin,
@@ -731,18 +739,27 @@ class GlueSource(StatefulIngestionSourceBase):
             return table
         return {**table, "StorageDescriptor": storage_descriptor}
 
-    def _resource_link_owner_upstreams(self, table: Dict) -> List[UpstreamClass]:
-        """Build the cross-account upstream edge from a Lake Formation resource link to its owner.
+    def _resource_link_owner_lineage(
+        self,
+        table: Dict,
+        dataset_urn: str,
+        schema_metadata: Optional[SchemaMetadata],
+    ) -> ResourceLinkLineage:
+        """Build the cross-account lineage from a Lake Formation resource link to its owner.
 
         A resource-link table carries a ``TargetTable`` pointing at the shared table in the owning
         account. The link is emitted as a consumer-instance table (the normal flow) with an upstream
         edge to the owner's table URN — stamped with the owner account's instance — so the shared
-        dataset stitches back to its source instead of appearing as an unrelated duplicate. Returns
-        an empty list for non-resource-link tables, or when the target is missing identifiers.
+        dataset stitches back to its source instead of appearing as an unrelated duplicate.
+
+        A resource link is the *same physical table* as its target, so when its schema is known
+        (backfilled via ``resolve_resource_link_schema``) each column maps 1:1 to the identically
+        named owner column — an identity column-level lineage. Returns empty lineage for
+        non-resource-link tables, or when the target is missing identifiers.
         """
         target = table.get("TargetTable")
         if not target:
-            return []
+            return ResourceLinkLineage(upstreams=[], fine_grained_lineages=[])
 
         database_name = target.get("DatabaseName")
         name = target.get("Name")
@@ -754,7 +771,7 @@ class GlueSource(StatefulIngestionSourceBase):
                 "table will be ingested without lineage back to its owner.",
                 context=f"{table.get('DatabaseName')}.{table.get('Name')} -> {target}",
             )
-            return []
+            return ResourceLinkLineage(upstreams=[], fine_grained_lineages=[])
 
         owner = self._resolve_platform_instance(target.get("CatalogId"))
         owner_urn = make_dataset_urn_with_platform_instance(
@@ -763,7 +780,21 @@ class GlueSource(StatefulIngestionSourceBase):
             env=owner.env,
             platform_instance=owner.platform_instance,
         )
-        return [UpstreamClass(dataset=owner_urn, type=DatasetLineageTypeClass.COPY)]
+        # Identity column mapping: the link and its target share the same schema, so pass the link's
+        # own schema for both sides. Only possible when the schema was backfilled; skipped otherwise.
+        fine_grained_lineages = (
+            self.get_fine_grained_lineages(
+                dataset_urn, owner_urn, schema_metadata, schema_metadata
+            )
+            if schema_metadata
+            else None
+        )
+        return ResourceLinkLineage(
+            upstreams=[
+                UpstreamClass(dataset=owner_urn, type=DatasetLineageTypeClass.COPY)
+            ],
+            fine_grained_lineages=fine_grained_lineages or [],
+        )
 
     @classmethod
     def create(cls, config_dict, ctx):
@@ -2097,29 +2128,34 @@ class GlueSource(StatefulIngestionSourceBase):
         # Add lineage if enabled. Storage lineage and Lake Formation resource-link lineage both
         # target this dataset's own URN with a full-replace UpstreamLineage aspect, so they must be
         # merged into one aspect — emitting both separately would clobber whichever GMS applies last.
-        resource_link_upstreams = self._resource_link_owner_upstreams(table)
+        rl = self._resource_link_owner_lineage(table, dataset_urn, schema_metadata)
         lineage_wu = self.get_lineage_if_enabled(metadata_record)
         if (
             lineage_wu is not None
-            and resource_link_upstreams
+            and rl.upstreams
             and isinstance(lineage_wu.metadata, MetadataChangeProposalWrapper)
             and lineage_wu.metadata.entityUrn == dataset_urn
             and isinstance(lineage_wu.metadata.aspect, UpstreamLineageClass)
         ):
-            # Upstream-direction storage lineage lands on this dataset's URN — fold the owner edge in.
-            lineage_wu.metadata.aspect.upstreams = [
-                *lineage_wu.metadata.aspect.upstreams,
-                *resource_link_upstreams,
-            ]
+            # Upstream-direction storage lineage lands on this dataset's URN — fold the owner edges in.
+            aspect = lineage_wu.metadata.aspect
+            aspect.upstreams = [*aspect.upstreams, *rl.upstreams]
+            aspect.fineGrainedLineages = [
+                *(aspect.fineGrainedLineages or []),
+                *rl.fine_grained_lineages,
+            ] or None
             yield lineage_wu
         else:
             # Storage lineage is off or targets a different URN (downstream direction); emit each.
             if lineage_wu is not None:
                 yield lineage_wu
-            if resource_link_upstreams:
+            if rl.upstreams:
                 yield MetadataChangeProposalWrapper(
                     entityUrn=dataset_urn,
-                    aspect=UpstreamLineageClass(upstreams=resource_link_upstreams),
+                    aspect=UpstreamLineageClass(
+                        upstreams=rl.upstreams,
+                        fineGrainedLineages=rl.fine_grained_lineages or None,
+                    ),
                 ).as_workunit()
 
         # Add profile if enabled

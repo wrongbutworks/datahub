@@ -19,7 +19,7 @@
         }
     },
     "systemMetadata": {
-        "lastObserved": 1781871440386,
+        "lastObserved": 1783520634913,
         "runId": "glue-source-test",
         "lastRunId": "no-run-id-provided"
     }
@@ -35,7 +35,7 @@
         }
     },
     "systemMetadata": {
-        "lastObserved": 1781871440386,
+        "lastObserved": 1783520634913,
         "runId": "glue-source-test",
         "lastRunId": "no-run-id-provided"
     }
@@ -52,7 +52,7 @@
         }
     },
     "systemMetadata": {
-        "lastObserved": 1781871440386,
+        "lastObserved": 1783520634913,
         "runId": "glue-source-test",
         "lastRunId": "no-run-id-provided"
     }
@@ -70,7 +70,7 @@
         }
     },
     "systemMetadata": {
-        "lastObserved": 1781871440386,
+        "lastObserved": 1783520634913,
         "runId": "glue-source-test",
         "lastRunId": "no-run-id-provided"
     }
@@ -91,7 +91,7 @@
         }
     },
     "systemMetadata": {
-        "lastObserved": 1781871440386,
+        "lastObserved": 1783520634913,
         "runId": "glue-source-test",
         "lastRunId": "no-run-id-provided"
     }
@@ -113,7 +113,7 @@
         }
     },
     "systemMetadata": {
-        "lastObserved": 1781871440387,
+        "lastObserved": 1783520634914,
         "runId": "glue-source-test",
         "lastRunId": "no-run-id-provided"
     }
@@ -197,7 +197,7 @@
         }
     },
     "systemMetadata": {
-        "lastObserved": 1781871440387,
+        "lastObserved": 1783520634914,
         "runId": "glue-source-test",
         "lastRunId": "no-run-id-provided"
     }
@@ -215,7 +215,7 @@
         }
     },
     "systemMetadata": {
-        "lastObserved": 1781871440387,
+        "lastObserved": 1783520634914,
         "runId": "glue-source-test",
         "lastRunId": "no-run-id-provided"
     }
@@ -231,7 +231,7 @@
         }
     },
     "systemMetadata": {
-        "lastObserved": 1781871440387,
+        "lastObserved": 1783520634914,
         "runId": "glue-source-test",
         "lastRunId": "no-run-id-provided"
     }
@@ -256,7 +256,7 @@
         }
     },
     "systemMetadata": {
-        "lastObserved": 1781871440387,
+        "lastObserved": 1783520634914,
         "runId": "glue-source-test",
         "lastRunId": "no-run-id-provided"
     }
@@ -278,7 +278,7 @@
         }
     },
     "systemMetadata": {
-        "lastObserved": 1781871440388,
+        "lastObserved": 1783520634915,
         "runId": "glue-source-test",
         "lastRunId": "no-run-id-provided"
     }
@@ -363,7 +363,7 @@
         }
     },
     "systemMetadata": {
-        "lastObserved": 1781871440388,
+        "lastObserved": 1783520634915,
         "runId": "glue-source-test",
         "lastRunId": "no-run-id-provided"
     }
@@ -384,11 +384,35 @@
                     "dataset": "urn:li:dataset:(urn:li:dataPlatform:glue,owner_domain.test-database.transactions,PROD)",
                     "type": "COPY"
                 }
+            ],
+            "fineGrainedLineages": [
+                {
+                    "upstreamType": "FIELD_SET",
+                    "upstreams": [
+                        "urn:li:schemaField:(urn:li:dataset:(urn:li:dataPlatform:glue,owner_domain.test-database.transactions,PROD),txn_id)"
+                    ],
+                    "downstreamType": "FIELD",
+                    "downstreams": [
+                        "urn:li:schemaField:(urn:li:dataset:(urn:li:dataPlatform:glue,consumer_domain.mixed-database.shared-transactions,PROD),txn_id)"
+                    ],
+                    "confidenceScore": 1.0
+                },
+                {
+                    "upstreamType": "FIELD_SET",
+                    "upstreams": [
+                        "urn:li:schemaField:(urn:li:dataset:(urn:li:dataPlatform:glue,owner_domain.test-database.transactions,PROD),amount)"
+                    ],
+                    "downstreamType": "FIELD",
+                    "downstreams": [
+                        "urn:li:schemaField:(urn:li:dataset:(urn:li:dataPlatform:glue,consumer_domain.mixed-database.shared-transactions,PROD),amount)"
+                    ],
+                    "confidenceScore": 1.0
+                }
             ]
         }
     },
     "systemMetadata": {
-        "lastObserved": 1781871440388,
+        "lastObserved": 1783520634915,
         "runId": "glue-source-test",
         "lastRunId": "no-run-id-provided"
     }
@@ -406,7 +430,7 @@
         }
     },
     "systemMetadata": {
-        "lastObserved": 1781871440388,
+        "lastObserved": 1783520634915,
         "runId": "glue-source-test",
         "lastRunId": "no-run-id-provided"
     }
@@ -422,7 +446,7 @@
         }
     },
     "systemMetadata": {
-        "lastObserved": 1781871440388,
+        "lastObserved": 1783520634915,
         "runId": "glue-source-test",
         "lastRunId": "no-run-id-provided"
     }
@@ -447,7 +471,7 @@
         }
     },
     "systemMetadata": {
-        "lastObserved": 1781871440388,
+        "lastObserved": 1783520634915,
         "runId": "glue-source-test",
         "lastRunId": "no-run-id-provided"
     }
@@ -469,7 +493,7 @@
         ]
     },
     "systemMetadata": {
-        "lastObserved": 1781871440388,
+        "lastObserved": 1783520634915,
         "runId": "glue-source-test",
         "lastRunId": "no-run-id-provided"
     }
